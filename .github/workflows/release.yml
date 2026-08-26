@@ -1,0 +1,87 @@
+# Build the till installer.
+#
+# On Windows, because that is the only place `pkg` can produce the exe the shops run and the only
+# place the packaged binary can be smoke-tested before it reaches a counter. A build that has
+# never been started once is not a release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build the agent exe
+        run: npm run build
+
+      - name: Fetch the service host
+        # WinSW answers the Windows service control manager on our behalf; a pkg-built console
+        # binary cannot, and a service registered directly on it is killed at start for not
+        # responding. Pinned rather than "latest" — a till fleet should not pick up a new service
+        # host because a release happened somewhere else.
+        run: |
+          $url = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile dist/sos-print-agent-service.exe
+
+      - name: Assemble the release folder
+        run: |
+          Copy-Item installer/sos-print-agent.xml dist/sos-print-agent-service.xml
+          Copy-Item installer/install.ps1 dist/
+          Copy-Item README.md dist/
+
+      - name: Smoke test the packaged exe
+        # Starts the real binary the shops will run and asks it the same question the app asks.
+        # Catches a broken pkg bundle here rather than on a counter.
+        run: |
+          $agent = Start-Process -FilePath dist/sos-print-agent.exe -PassThru
+          try {
+            $ok = $false
+            foreach ($attempt in 1..15) {
+              Start-Sleep -Seconds 1
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:9110/health" -TimeoutSec 2
+                if ($health.ok) { $ok = $true; Write-Host "agent $($health.version) answered, renderer=$($health.renderer)"; break }
+              } catch { }
+            }
+            if (-not $ok) { throw "the packaged exe never answered on 127.0.0.1:9110" }
+            # A GitHub runner has no printers, so /printers is expected to fail — what matters is
+            # that it fails as JSON rather than by taking the process down.
+            try { Invoke-RestMethod -Uri "http://127.0.0.1:9110/printers" -TimeoutSec 5 } catch { }
+            if ($agent.HasExited) { throw "the agent exited while being asked for printers" }
+          } finally {
+            Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Zip it
+        run: Compress-Archive -Path dist/* -DestinationPath sos-print-agent.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sos-print-agent
+          path: sos-print-agent.zip
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sos-print-agent.zip
+          # The Download button on the Printer Settings page points at /releases/latest, so the
+          # asset name has to stay the same across releases.
+          fail_on_unmatched_files: true

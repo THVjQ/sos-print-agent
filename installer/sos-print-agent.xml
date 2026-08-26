@@ -1,0 +1,43 @@
+<!--
+  WinSW service definition.
+
+  A pkg-built Node binary is a console program, not a Windows service: registered directly with
+  sc.exe it starts, never answers the service control manager, and Windows kills it with "did not
+  respond in a timely fashion". WinSW is the thin service host that answers those messages and
+  runs our exe as a child. That indirection is not optional plumbing — it is the difference
+  between a service that starts and one that appears to install and never runs.
+-->
+<service>
+  <id>SOSPrintAgent</id>
+  <name>SOS POS Print Agent</name>
+  <description>Prints stickers, dockets, receipts and reports from SOS POS to this PC's printers.</description>
+
+  <executable>%BASE%\sos-print-agent.exe</executable>
+
+  <!-- LocalSystem sees the machine's printers, which is what we enumerate and spool to. -->
+  <serviceaccount>
+    <username>LocalSystem</username>
+  </serviceaccount>
+
+  <startmode>Automatic</startmode>
+
+  <!--
+    Come back from a crash rather than leaving a shop with silent printing. The third failure
+    onwards is a real fault, so it stops trying and leaves it in the event log instead of
+    thrashing.
+  -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="none"/>
+
+  <!-- The agent keeps its own rotating log in ProgramData; this one is just WinSW's own. -->
+  <logpath>%ProgramData%\SOSPrintAgent</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>2048</sizeThreshold>
+    <keepFiles>2</keepFiles>
+  </log>
+
+  <!-- Uncomment to point a till at a staging build of SOS POS.
+  <env name="SOS_PRINT_ALLOWED_ORIGINS" value="https://staging.sospos.com.au"/>
+  -->
+</service>
