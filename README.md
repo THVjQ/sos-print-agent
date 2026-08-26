@@ -38,22 +38,33 @@ forget, and there is a test for it.
 
 ## Install
 
-Download `sos-print-agent.zip` from [Releases](../../releases/latest), unzip it on the till, then
-from an **Administrator** PowerShell:
+In SOS POS: **Settings → Printer Settings → Download installer**. Run the downloaded
+`SOS Print Agent Setup.exe`, accept the one UAC prompt, done — the service is registered and
+started before the window closes, and the chip on the settings page turns green on its own.
+
+Nothing is configured during the install. Which printer prints what is set once per store in SOS
+POS, and every till in that store follows it.
+
+Uninstall from Add/Remove Programs like any other application.
+
+### Deploying without clicking
+
+`sos-print-agent.zip` on the same release carries the raw binaries and `install.ps1`, for MDM,
+GPO, or a technician doing a row of counters:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
-```
-
-That copies the agent into Program Files, registers it as a service that starts with the machine,
-starts it, and checks it answers. To remove it:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 ```
 
-Then open SOS POS → Settings → Printer Settings. The chip at the top should read **Print agent
-connected**, and each of the five tabs can pick a printer.
+Both routes install the same service; use whichever suits the shop.
+
+### The installer is unsigned
+
+Windows SmartScreen will say *"Windows protected your PC"* and hide the Run button behind **More
+info**. That is the moment a non-technical person stops, so it is worth buying a code-signing
+certificate before this reaches 26 shops rather than teaching every store to click past a
+security warning.
 
 ## What it renders with
 
@@ -138,3 +149,10 @@ npm test
 
 Runs on Linux and macOS for working on the app against a real browser — rendering works, and
 `/printers` and `/print` answer `unsupported_platform`, because the spooler is Windows-only.
+
+**Everything except [src/printers.js](src/printers.js) is already cross-platform.** Rendering,
+the HTTP surface, the queue and the logging make no assumption about the OS, and
+[src/render.js](src/render.js) already knows where Edge and Chrome live on macOS. A macOS or
+Linux build is that one file against CUPS — `lpstat` to enumerate, `lp -d` to spool — plus a
+launchd plist in place of the Windows service. It is not written because every till in the fleet
+is Windows; it is small if that changes.

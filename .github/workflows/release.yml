@@ -69,19 +69,40 @@ jobs:
             Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Zip it
-        run: Compress-Archive -Path dist/* -DestinationPath sos-print-agent.zip -Force
+      - name: Build the installer
+        # The thing a shop double-clicks. Inno Setup is on the windows runner image; installed
+        # explicitly if that ever stops being true, because a release that silently falls back to
+        # "zip only" would leave the Download button in SOS POS handing out a PowerShell script.
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          $env:AGENT_VERSION = (Get-Content package.json | ConvertFrom-Json).version
+          & $iscc installer/sos-print-agent.iss
+          if (-not (Test-Path dist/SOS-Print-Agent-Setup.exe)) { throw "the installer was not produced" }
+
+      - name: Zip the script-deploy bundle
+        # For MDM, GPO, or anyone deploying this without clicking. The installer exe above is what
+        # the Download button in SOS POS hands out.
+        run: Compress-Archive -Path dist/sos-print-agent.exe,dist/sos-print-agent-service.exe,dist/sos-print-agent-service.xml,dist/install.ps1,dist/README.md -DestinationPath dist/sos-print-agent.zip -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: sos-print-agent
-          path: sos-print-agent.zip
+          path: |
+            dist/SOS-Print-Agent-Setup.exe
+            dist/sos-print-agent.zip
 
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: sos-print-agent.zip
-          # The Download button on the Printer Settings page points at /releases/latest, so the
-          # asset name has to stay the same across releases.
+          files: |
+            dist/SOS-Print-Agent-Setup.exe
+            dist/sos-print-agent.zip
+          # SOS POS serves the installer by this exact name — see
+          # mono/app/api/print-agent/download/route.ts. Renaming it breaks the Download button in
+          # every store at once, so it stays stable across releases.
           fail_on_unmatched_files: true
