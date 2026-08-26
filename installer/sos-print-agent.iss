@@ -87,9 +87,10 @@ begin
   if CurStep = ssPostInstall then
   begin
     if not ServiceAnswers() then
-      MsgBox('The print agent was installed but is not answering yet.' #13#10#13#10
-             'Open SOS POS, go to Settings then Printer Settings, and press Recheck. If it still '
-             'says not detected, send us %PROGRAMDATA%\SOSPrintAgent\agent.log.',
+      MsgBox('The print agent was installed but is not answering yet.' + #13#10#13#10 +
+             'Open SOS POS, go to Settings then Printer Settings, and press Recheck. ' +
+             'If it still says not detected, send us ' +
+             ExpandConstant('{commonappdata}\SOSPrintAgent\agent.log') + '.',
              mbInformation, MB_OK);
   end;
 end;
