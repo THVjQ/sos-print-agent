@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/index.js",
     "build": "pkg . --targets node18-win-x64 --output dist/sos-print-agent.exe",
-    "test": "node --test test/*.test.js"
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.21.2",
