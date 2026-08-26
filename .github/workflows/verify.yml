@@ -1,0 +1,270 @@
+# Everything about this agent that can only be proved on Windows.
+#
+# The unit tests run anywhere and cover the HTTP surface. They cannot tell you whether the
+# packaged exe starts, whether the service registers, whether Edge on a real Windows box honours
+# the page size a label needs, or whether a job actually reaches a printer. All of that is here,
+# on a real Windows machine, so a failure is found in a build rather than at a counter.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      # ------------------------------------------------------------------ rendering ------
+      - name: Edge renders a label at the exact size the CSS asks for
+        # The one assumption the whole design rests on. `preferCSSPageSize` is what makes
+        # Chromium honour `@page { size: 54mm 25.4mm }` instead of scaling the content onto
+        # Letter — which on a label printer means a sticker shrunk into the corner of nothing.
+        run: |
+          $script = @'
+          const { htmlToPdf, findBrowser, closeRenderer } = require("./src/render.js");
+          const fs = require("fs");
+
+          const sticker = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+          <style>@page { size: 54mm 25.4mm; margin: 0; } body { margin:0; font-size:9pt; background:#eee }</style>
+          </head><body><div>TICKET #A0001</div><div>JOHN SMITH</div>
+          <script>window.onload=function(){window.print();window.onafterprint=function(){window.close();};};<\/script>
+          </body></html>`;
+
+          const a4 = `<!DOCTYPE html><html><head>
+          <style>@page { size: A4; margin: 0; } .page{padding:8mm}</style></head>
+          <body><div class="page">report</div>
+          <script>window.onload=function(){window.print();};<\/script></body></html>`;
+
+          function pageSize(pdf) {
+            const text = pdf.toString("latin1");
+            const m = text.match(/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)/);
+            if (!m) throw new Error("no MediaBox in the produced PDF");
+            return [parseFloat(m[1]), parseFloat(m[2])];
+          }
+
+          (async () => {
+            console.log("renderer:", findBrowser());
+            if (!findBrowser()) throw new Error("no Edge or Chrome on this machine");
+
+            const t0 = Date.now();
+            const label = await htmlToPdf(sticker);
+            const cold = Date.now() - t0;
+            fs.writeFileSync("sticker.pdf", label);
+
+            const [w, h] = pageSize(label);
+            console.log(`sticker: ${w} x ${h} pt  (${label.length} bytes, ${cold}ms cold)`);
+            // 54mm = 153.07pt, 25.4mm = 72pt. A point or so of rounding is fine; Letter is not.
+            if (Math.abs(w - 153.07) > 1.5 || Math.abs(h - 72) > 1.5) {
+              throw new Error(`label came out ${w}x${h}pt, expected about 153x72pt`);
+            }
+
+            const t1 = Date.now();
+            const report = await htmlToPdf(a4);
+            console.log(`a4: ${pageSize(report).join(" x ")} pt (${Date.now() - t1}ms warm)`);
+            const [aw, ah] = pageSize(report);
+            if (Math.abs(aw - 595) > 3 || Math.abs(ah - 842) > 3) {
+              throw new Error(`report came out ${aw}x${ah}pt, expected about 595x842pt`);
+            }
+
+            // The page's own window.print()/window.close() must not close the tab mid-render.
+            // When that regressed the only symptom was "Printing failed" with no cause.
+            const t2 = Date.now();
+            await htmlToPdf(sticker);
+            console.log(`second label ok (${Date.now() - t2}ms warm)`);
+
+            await closeRenderer();
+            console.log("RENDER OK");
+          })().catch((e) => { console.error(e); process.exit(1); });
+          '@
+          Set-Content -Path render-check.js -Value $script -Encoding UTF8
+          node render-check.js
+
+      # ------------------------------------------------------------------ packaging ------
+      - name: Build the exe
+        run: npm run build
+
+      - name: Fetch the service host
+        run: |
+          $url = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile dist/sos-print-agent-service.exe
+
+      - name: Build the installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          Copy-Item installer/sos-print-agent.xml dist/sos-print-agent-service.xml
+          $env:AGENT_VERSION = (Get-Content package.json | ConvertFrom-Json).version
+          & $iscc installer/sos-print-agent.iss
+          if (-not (Test-Path dist/SOS-Print-Agent-Setup.exe)) { throw "the installer was not produced" }
+
+      # ------------------------------------------------------------------ a printer ------
+      - name: Give this machine a printer that writes to a file
+        # A local port whose name is a file path makes the spooler write straight to that file
+        # with no dialog, so "did the job actually reach a printer" becomes a thing we can assert
+        # rather than a thing we hope.
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\sos-test | Out-Null
+          Add-PrinterPort -Name "C:\sos-test\out.pdf" -ErrorAction SilentlyContinue
+          Add-Printer -Name "SOS Test PDF" -DriverName "Microsoft Print to PDF" -PortName "C:\sos-test\out.pdf"
+          Get-Printer | Format-Table Name, DriverName, PortName
+
+      # ------------------------------------------------------------------ installing ----
+      - name: Install it the way a shop would
+        run: |
+          $p = Start-Process -FilePath dist/SOS-Print-Agent-Setup.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "the installer failed with $($p.ExitCode)" }
+
+      - name: The service is registered, automatic, and running
+        run: |
+          $svc = Get-Service -Name SOSPrintAgent -ErrorAction Stop
+          $wmi = Get-CimInstance Win32_Service -Filter "Name='SOSPrintAgent'"
+          Write-Host "status=$($svc.Status) start=$($wmi.StartMode) account=$($wmi.StartName)"
+          if ($svc.Status -ne "Running") { throw "the service is $($svc.Status), not Running" }
+          if ($wmi.StartMode -ne "Auto") { throw "the service is $($wmi.StartMode), not Automatic — it would not survive a reboot" }
+
+      - name: It answers, and can see the printers on this PC
+        run: |
+          $health = $null
+          foreach ($i in 1..20) {
+            try { $health = Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 2; break } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $health.ok) { throw "no answer from the agent" }
+          Write-Host "agent v$($health.version) renderer=$($health.renderer)"
+          if (-not $health.renderer) { throw "the agent cannot find Edge or Chrome" }
+
+          $printers = Invoke-RestMethod http://127.0.0.1:9110/printers -TimeoutSec 15
+          Write-Host "printers: $($printers.printers.name -join ', ')"
+          if ($printers.printers.name -notcontains "SOS Test PDF") { throw "the agent cannot see the printer we just installed" }
+
+      - name: The browser is allowed to talk to it
+        # Without Access-Control-Allow-Private-Network Chromium never sends the real request, and
+        # the app cannot tell that apart from "no agent installed".
+        run: |
+          $res = Invoke-WebRequest -Uri http://127.0.0.1:9110/print -Method Options -Headers @{
+            "Origin" = "https://app.sospos.com.au"
+            "Access-Control-Request-Method" = "POST"
+            "Access-Control-Request-Private-Network" = "true"
+          } -UseBasicParsing
+          if ($res.StatusCode -ne 204) { throw "preflight returned $($res.StatusCode)" }
+          if ($res.Headers["Access-Control-Allow-Private-Network"] -ne "true") { throw "the private-network header is missing" }
+          if ($res.Headers["Access-Control-Allow-Origin"] -ne "https://app.sospos.com.au") { throw "the origin was not allowed" }
+          Write-Host "preflight ok"
+
+      - name: A sticker actually comes out of the printer
+        run: |
+          Remove-Item C:\sos-test\out.pdf -ErrorAction SilentlyContinue
+          $html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>@page{size:54mm 25.4mm;margin:0}body{margin:0;font-family:Arial;font-size:9pt}</style></head><body><div>TICKET #A0001</div><div>JOHN SMITH</div><div>IPHONE 14 PRO</div><script>window.onload=function(){window.print();window.onafterprint=function(){window.close();};};</script></body></html>'
+          $body = @{ printerName = "SOS Test PDF"; html = $html; jobName = "CI sticker" } | ConvertTo-Json
+          $res = Invoke-RestMethod http://127.0.0.1:9110/print -Method Post -Body $body -ContentType "application/json" -TimeoutSec 90
+          if (-not $res.ok) { throw "print refused: $($res | ConvertTo-Json -Compress)" }
+          Write-Host "job $($res.jobId) accepted"
+
+          # The spooler writes asynchronously; wait for the bytes rather than assuming them.
+          $found = $false
+          foreach ($i in 1..40) {
+            if ((Test-Path C:\sos-test\out.pdf) -and (Get-Item C:\sos-test\out.pdf).Length -gt 0) { $found = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $found) { throw "the job was accepted but nothing reached the printer" }
+          $size = (Get-Item C:\sos-test\out.pdf).Length
+          Write-Host "printer received $size bytes"
+
+      - name: Reports print too, on a different page size
+        run: |
+          Remove-Item C:\sos-test\out.pdf -ErrorAction SilentlyContinue
+          $html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>@page{size:A4;margin:0}.page{padding:8mm;font-family:Arial}</style></head><body><div class="page"><h1>Damage Report</h1><p>Body copy.</p></div><script>window.onload=function(){window.print();};</script></body></html>'
+          $body = @{ printerName = "SOS Test PDF"; html = $html; jobName = "CI report" } | ConvertTo-Json
+          $res = Invoke-RestMethod http://127.0.0.1:9110/print -Method Post -Body $body -ContentType "application/json" -TimeoutSec 90
+          if (-not $res.ok) { throw "print refused: $($res | ConvertTo-Json -Compress)" }
+          foreach ($i in 1..40) {
+            if ((Test-Path C:\sos-test\out.pdf) -and (Get-Item C:\sos-test\out.pdf).Length -gt 0) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not (Test-Path C:\sos-test\out.pdf)) { throw "the report never reached the printer" }
+          Write-Host "report printed, $((Get-Item C:\sos-test\out.pdf).Length) bytes"
+
+      - name: Several jobs in a row, in order
+        # A shop printing a run of refurb labels. The agent serialises them; this is the check
+        # that the queue does not drop or deadlock one.
+        run: |
+          foreach ($n in 1..3) {
+            $html = "<!DOCTYPE html><html><head><style>@page{size:54mm 25.4mm;margin:0}</style></head><body>label $n<script>window.onload=function(){window.print();};</script></body></html>"
+            $body = @{ printerName = "SOS Test PDF"; html = $html; jobName = "CI batch $n" } | ConvertTo-Json
+            $res = Invoke-RestMethod http://127.0.0.1:9110/print -Method Post -Body $body -ContentType "application/json" -TimeoutSec 90
+            if (-not $res.ok) { throw "batch job $n refused" }
+            Write-Host "batch $n ok"
+          }
+
+      - name: The failures fail the way the app expects
+        # These error codes are what SOS POS turns into "choose a printer" or "install the
+        # agent". If they change shape, the app shows the wrong advice.
+        run: |
+          function PrintErr($body) {
+            try {
+              Invoke-RestMethod http://127.0.0.1:9110/print -Method Post -Body ($body | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 60 | Out-Null
+              throw "expected a refusal, got success"
+            } catch [System.Net.WebException], [Microsoft.PowerShell.Commands.HttpResponseException] {
+              $stream = $_.Exception.Response.GetResponseStream()
+              $reader = New-Object System.IO.StreamReader($stream)
+              return ($reader.ReadToEnd() | ConvertFrom-Json)
+            }
+          }
+          $e1 = PrintErr @{ html = "<html><head></head><body>x</body></html>" }
+          if ($e1.error -ne "printer_required") { throw "no printer name gave '$($e1.error)'" }
+          $e2 = PrintErr @{ printerName = "SOS Test PDF" }
+          if ($e2.error -ne "nothing_to_print") { throw "no document gave '$($e2.error)'" }
+          $e3 = PrintErr @{ printerName = "No Such Printer"; html = "<html><head></head><body>x</body></html>" }
+          if ($e3.error -ne "printer_not_found") { throw "unknown printer gave '$($e3.error)'" }
+          Write-Host "printer_required / nothing_to_print / printer_not_found all correct"
+
+      - name: It survives being restarted, as it must across a reboot
+        run: |
+          Restart-Service -Name SOSPrintAgent -Force
+          $ok = $false
+          foreach ($i in 1..20) {
+            try { if ((Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 2).ok) { $ok = $true; break } } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $ok) { throw "the agent did not come back after a restart" }
+          Write-Host "came back after restart"
+
+      - name: The log a shop would be asked to send exists
+        run: |
+          $log = "$env:ProgramData\SOSPrintAgent\agent.log"
+          if (-not (Test-Path $log)) { throw "no log at $log" }
+          Write-Host "--- last 30 lines ---"
+          Get-Content $log -Tail 30
+
+      - name: Uninstalling leaves nothing behind
+        run: |
+          $uninst = Get-ChildItem "${env:ProgramFiles}\SOS Print Agent\unins*.exe" | Select-Object -First 1
+          if (-not $uninst) { throw "no uninstaller in the install directory" }
+          $p = Start-Process -FilePath $uninst.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          Start-Sleep -Seconds 5
+          if (Get-Service -Name SOSPrintAgent -ErrorAction SilentlyContinue) { throw "the service is still registered after uninstall" }
+          try {
+            Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 3 | Out-Null
+            throw "something is still listening on 9110 after uninstall"
+          } catch [Microsoft.PowerShell.Commands.HttpResponseException] { throw "still answering after uninstall" } catch { }
+          Write-Host "clean"
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-verification
+          path: |
+            sticker.pdf
+            C:\sos-test\out.pdf
+          if-no-files-found: warn
