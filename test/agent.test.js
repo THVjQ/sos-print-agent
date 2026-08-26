@@ -14,7 +14,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { app } = require("../src/app");
-const { neutralisePrintScripts } = require("../src/render");
+const { neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm } = require("../src/render");
 
 /** Start on a port the OS picks, so the tests run on a machine with the service installed. */
 function withServer(run) {
@@ -106,4 +106,31 @@ test("a document with no head, or no html tag at all, still gets the stub first"
 
   const bare = neutralisePrintScripts("<div>x</div>");
   assert.ok(bare.startsWith("<script>window.print"));
+});
+
+test("a roll's @page size is recognised, and a fixed one is left alone", () => {
+  const auto = (css) => autoHeightWidthMm(readPageRule(`<style>@page { ${css} }</style>`));
+
+  // `size: 80mm auto` is invalid CSS — `auto` may only appear on its own — so Chromium discards
+  // the whole declaration and falls back to Letter. Every receipt and docket template writes it,
+  // and through the browser's print dialog it never showed because the printer driver's own
+  // paper size took over. Recognising it here is what keeps an 80mm receipt off a 216mm page.
+  assert.equal(auto("size: 80mm auto; margin: 5mm;"), 80);
+  assert.equal(auto("size: 58mm auto;"), 58);
+  assert.ok(Math.abs(auto("size:3in auto") - 76.2) < 0.001);
+
+  // Fixed sizes must NOT take the measuring path — they are handed to preferCSSPageSize whole.
+  assert.equal(auto("size: 54mm 25.4mm; margin: 0;"), null);
+  assert.equal(auto("size: A4; margin: 0;"), null);
+  assert.equal(auto("size: auto;"), null);
+  assert.equal(autoHeightWidthMm(readPageRule("<style>body{margin:0}</style>")), null);
+});
+
+test("lengths convert to millimetres whatever unit they arrive in", () => {
+  assert.equal(toMm("80mm"), 80);
+  assert.equal(toMm("8cm"), 80);
+  assert.equal(toMm("1in"), 25.4);
+  assert.equal(Math.round(toMm("72pt") * 100) / 100, 25.4);
+  assert.equal(Math.round(toMm("96px") * 100) / 100, 25.4);
+  assert.equal(toMm("not a length"), null);
 });

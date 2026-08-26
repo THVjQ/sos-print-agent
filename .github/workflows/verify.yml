@@ -26,69 +26,12 @@ jobs:
         run: npm test
 
       # ------------------------------------------------------------------ rendering ------
-      - name: Edge renders a label at the exact size the CSS asks for
-        # The one assumption the whole design rests on. `preferCSSPageSize` is what makes
-        # Chromium honour `@page { size: 54mm 25.4mm }` instead of scaling the content onto
-        # Letter — which on a label printer means a sticker shrunk into the corner of nothing.
-        run: |
-          $script = @'
-          const { htmlToPdf, findBrowser, closeRenderer } = require("./src/render.js");
-          const fs = require("fs");
-
-          const sticker = `<!DOCTYPE html><html><head><meta charset="UTF-8">
-          <style>@page { size: 54mm 25.4mm; margin: 0; } body { margin:0; font-size:9pt; background:#eee }</style>
-          </head><body><div>TICKET #A0001</div><div>JOHN SMITH</div>
-          <script>window.onload=function(){window.print();window.onafterprint=function(){window.close();};};<\/script>
-          </body></html>`;
-
-          const a4 = `<!DOCTYPE html><html><head>
-          <style>@page { size: A4; margin: 0; } .page{padding:8mm}</style></head>
-          <body><div class="page">report</div>
-          <script>window.onload=function(){window.print();};<\/script></body></html>`;
-
-          function pageSize(pdf) {
-            const text = pdf.toString("latin1");
-            const m = text.match(/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)/);
-            if (!m) throw new Error("no MediaBox in the produced PDF");
-            return [parseFloat(m[1]), parseFloat(m[2])];
-          }
-
-          (async () => {
-            console.log("renderer:", findBrowser());
-            if (!findBrowser()) throw new Error("no Edge or Chrome on this machine");
-
-            const t0 = Date.now();
-            const label = await htmlToPdf(sticker);
-            const cold = Date.now() - t0;
-            fs.writeFileSync("sticker.pdf", label);
-
-            const [w, h] = pageSize(label);
-            console.log(`sticker: ${w} x ${h} pt  (${label.length} bytes, ${cold}ms cold)`);
-            // 54mm = 153.07pt, 25.4mm = 72pt. A point or so of rounding is fine; Letter is not.
-            if (Math.abs(w - 153.07) > 1.5 || Math.abs(h - 72) > 1.5) {
-              throw new Error(`label came out ${w}x${h}pt, expected about 153x72pt`);
-            }
-
-            const t1 = Date.now();
-            const report = await htmlToPdf(a4);
-            console.log(`a4: ${pageSize(report).join(" x ")} pt (${Date.now() - t1}ms warm)`);
-            const [aw, ah] = pageSize(report);
-            if (Math.abs(aw - 595) > 3 || Math.abs(ah - 842) > 3) {
-              throw new Error(`report came out ${aw}x${ah}pt, expected about 595x842pt`);
-            }
-
-            // The page's own window.print()/window.close() must not close the tab mid-render.
-            // When that regressed the only symptom was "Printing failed" with no cause.
-            const t2 = Date.now();
-            await htmlToPdf(sticker);
-            console.log(`second label ok (${Date.now() - t2}ms warm)`);
-
-            await closeRenderer();
-            console.log("RENDER OK");
-          })().catch((e) => { console.error(e); process.exit(1); });
-          '@
-          Set-Content -Path render-check.js -Value $script -Encoding UTF8
-          node render-check.js
+      - name: Edge renders every page size the shop actually uses
+        # The one assumption the whole design rests on. `preferCSSPageSize` is what makes Chromium
+        # honour `@page { size: 54mm 25.4mm }` instead of scaling the content onto Letter — which
+        # on a label printer means a sticker shrunk into the corner of nothing. Run against the
+        # Edge that is really on this machine, which is not the browser this was developed on.
+        run: node scripts/render-check.js
 
       # ------------------------------------------------------------------ packaging ------
       - name: Build the exe
@@ -265,6 +208,6 @@ jobs:
         with:
           name: windows-verification
           path: |
-            sticker.pdf
+            render-check-output/*.pdf
             C:\sos-test\out.pdf
           if-no-files-found: warn

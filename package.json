@@ -1,7 +1,7 @@
 {
   "name": "sos-print-agent",
   "version": "1.0.0",
-  "description": "Localhost print agent for SOS POS \u2014 turns a print from the browser into paper from the right printer.",
+  "description": "Localhost print agent for SOS POS — turns a print from the browser into paper from the right printer.",
   "license": "UNLICENSED",
   "private": true,
   "main": "src/index.js",
@@ -17,6 +17,7 @@
     "puppeteer-core": "^23.11.1"
   },
   "devDependencies": {
+    "pdf-lib": "^1.17.1",
     "pkg": "^5.8.1"
   },
   "pkg": {
