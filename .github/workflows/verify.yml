@@ -15,6 +15,9 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    # A hang here is a real result — the last two were an installer that never returned. Fail in
+    # twenty minutes rather than holding a runner for six hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -74,8 +77,18 @@ jobs:
       # ------------------------------------------------------------------ installing ----
       - name: Install it the way a shop would
         run: |
-          $p = Start-Process -FilePath dist/SOS-Print-Agent-Setup.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          # Output redirected to files, and this is not optional plumbing.
+          #
+          # The installer starts the agent, and the agent inherits whatever handles the installer
+          # had. Inheriting the step's stdout pipe keeps that pipe open for as long as the agent
+          # runs — which is for ever — so the step never completes even though the install
+          # finished in seconds. Two runs sat on this for a quarter of an hour before it was
+          # obvious the install had worked and the *shell* was what was stuck.
+          $p = Start-Process -FilePath dist/SOS-Print-Agent-Setup.exe `
+                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `
+                 -Wait -PassThru -RedirectStandardOutput install-out.txt -RedirectStandardError install-err.txt
           Write-Host "installer exit code: $($p.ExitCode)"
+          Get-Content install-out.txt, install-err.txt -ErrorAction SilentlyContinue | Select-Object -Last 20
           if ($p.ExitCode -ne 0) { throw "the installer failed with $($p.ExitCode)" }
 
       - name: It is running, and set to start again at every logon
