@@ -232,16 +232,32 @@ jobs:
           if (Get-Process -Name sos-print-agent -ErrorAction SilentlyContinue) { throw "the agent is still running after uninstall" }
           $run = Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "SOS Print Agent" -ErrorAction SilentlyContinue
           if ($run.'SOS Print Agent') { throw "the autostart entry survived the uninstall" }
-          $res = Invoke-WebRequest -Uri http://127.0.0.1:9110/health -TimeoutSec 3 -SkipHttpErrorCheck -UseBasicParsing -ErrorAction SilentlyContinue
-          if ($res) { throw "something is still listening on 9110 after uninstall" }
+          # A refused connection is a *terminating* error, not an HTTP one, so neither
+          # -SkipHttpErrorCheck nor -ErrorAction reaches it — the step failed on the very thing it
+          # was asserting. Refused is the pass condition here, so it has to be caught.
+          $answered = $false
+          try {
+            Invoke-WebRequest -Uri http://127.0.0.1:9110/health -TimeoutSec 3 -UseBasicParsing | Out-Null
+            $answered = $true
+          } catch { }
+          if ($answered) { throw "something is still listening on 9110 after uninstall" }
           Write-Host "clean"
+
+      - name: Gather the evidence
+        if: always()
+        # upload-artifact refuses a path outside the workspace, and the virtual printer writes to
+        # C:\sos-test by definition — its port *is* that path.
+        run: |
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          Copy-Item render-check-output/*.pdf evidence/ -ErrorAction SilentlyContinue
+          Copy-Item C:\sos-test\out.pdf evidence/printed-last.pdf -ErrorAction SilentlyContinue
+          Copy-Item "$env:ProgramData\SOSPrintAgent\agent.log" evidence/ -ErrorAction SilentlyContinue
+          Get-ChildItem evidence | Format-Table Name, Length
 
       - name: Keep the evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-verification
-          path: |
-            render-check-output/*.pdf
-            C:\sos-test\out.pdf
+          path: evidence
           if-no-files-found: warn
