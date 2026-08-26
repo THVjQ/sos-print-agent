@@ -84,11 +84,21 @@ jobs:
           # runs — which is for ever — so the step never completes even though the install
           # finished in seconds. Two runs sat on this for a quarter of an hour before it was
           # obvious the install had worked and the *shell* was what was stuck.
+          # Waited on by polling rather than -Wait, and that is the whole trick.
+          #
+          # `Start-Process -Wait` does not simply wait for the process: with redirected streams it
+          # waits for those streams to close too, and the agent the installer starts inherits them
+          # and holds them open for as long as it runs — which is for ever. Redirecting to files
+          # moved the problem rather than fixing it. Polling `HasExited` asks the only question
+          # that matters and ignores the handles entirely.
           $p = Start-Process -FilePath dist/SOS-Print-Agent-Setup.exe `
-                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `
-                 -Wait -PassThru -RedirectStandardOutput install-out.txt -RedirectStandardError install-err.txt
+                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -PassThru
+          foreach ($i in 1..120) {
+            if ($p.HasExited) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $p.HasExited) { throw "the installer never returned" }
           Write-Host "installer exit code: $($p.ExitCode)"
-          Get-Content install-out.txt, install-err.txt -ErrorAction SilentlyContinue | Select-Object -Last 20
           if ($p.ExitCode -ne 0) { throw "the installer failed with $($p.ExitCode)" }
 
       - name: It is running, and set to start again at every logon
