@@ -56,9 +56,13 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
   ValueName: "SOS Print Agent"; ValueData: """{app}\sos-print-agent.exe"""; Flags: uninsdeletevalue
 
 [Run]
-; `runasoriginaluser` so it lands in the session of the person installing it, not in the elevated
-; one. Started now as well as at next logon, so the shop does not have to reboot to try it.
-Filename: "{app}\sos-print-agent.exe"; Flags: nowait runasoriginaluser
+; Started now as well as at next logon, so the shop does not have to reboot to try it.
+;
+; Not `runasoriginaluser`: that needs an interactive session token to hand the process to, and on
+; a machine where the installer is running without one it blocks for ever rather than failing —
+; a silent install that simply never returns. UAC elevates in place, so the plain form already
+; lands in the right session; it inherits elevation, which costs nothing here.
+Filename: "{app}\sos-print-agent.exe"; Flags: nowait
 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM sos-print-agent.exe"; Flags: runhidden; RunOnceId: "StopAgent"
