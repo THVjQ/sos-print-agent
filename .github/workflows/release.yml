@@ -31,18 +31,23 @@ jobs:
       - name: Build the agent exe
         run: npm run build
 
-      - name: Fetch the service host
-        # WinSW answers the Windows service control manager on our behalf; a pkg-built console
-        # binary cannot, and a service registered directly on it is killed at start for not
-        # responding. Pinned rather than "latest" — a till fleet should not pick up a new service
-        # host because a release happened somewhere else.
+      - name: Fetch the PDF viewer that does the spooling
+        # A real file next to the agent, never inside it: a binary packaged into the exe's own
+        # virtual filesystem cannot be executed, which is how the first build failed with
+        # "spawn C:\snapshot\...\SumatraPDF.exe ENOENT" only once it ran as a packaged exe.
         run: |
-          $url = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe"
-          Invoke-WebRequest -Uri $url -OutFile dist/sos-print-agent-service.exe
+          $url = "https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2-64.zip"
+          Invoke-WebRequest -Uri $url -OutFile sumatra.zip
+          Expand-Archive sumatra.zip -DestinationPath sumatra-unzip -Force
+          $exe = Get-ChildItem sumatra-unzip -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "no exe inside the SumatraPDF download" }
+          Copy-Item $exe.FullName dist/SumatraPDF.exe
+          # GPLv3: ship the licence alongside it.
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/sumatrapdfreader/sumatrapdf/master/COPYING" -OutFile dist/SumatraPDF-LICENSE
+          Write-Host "SumatraPDF $((Get-Item dist/SumatraPDF.exe).Length) bytes"
 
       - name: Assemble the release folder
         run: |
-          Copy-Item installer/sos-print-agent.xml dist/sos-print-agent-service.xml
           Copy-Item installer/install.ps1 dist/
           Copy-Item README.md dist/
 
@@ -86,7 +91,7 @@ jobs:
       - name: Zip the script-deploy bundle
         # For MDM, GPO, or anyone deploying this without clicking. The installer exe above is what
         # the Download button in SOS POS hands out.
-        run: Compress-Archive -Path dist/sos-print-agent.exe,dist/sos-print-agent-service.exe,dist/sos-print-agent-service.xml,dist/install.ps1,dist/README.md -DestinationPath dist/sos-print-agent.zip -Force
+        run: Compress-Archive -Path dist/sos-print-agent.exe,dist/SumatraPDF.exe,dist/SumatraPDF-LICENSE,dist/install.ps1,dist/README.md -DestinationPath dist/sos-print-agent.zip -Force
 
       - uses: actions/upload-artifact@v4
         with:

@@ -31,8 +31,18 @@ const server = app.listen(PORT, HOST, () => {
 });
 
 server.on("error", (err) => {
-  // Almost always a second copy of the agent already running: the service, plus somebody who
-  // double-clicked the exe to see what it did.
+  /*
+   * The port already being taken is not a fault.
+   *
+   * The agent starts for whoever logs in, and with fast user switching two sessions can both try.
+   * Loopback is per machine rather than per session, so the second one has nothing to do — the
+   * browser in either session reaches the copy that got there first. Exiting quietly keeps that
+   * out of the event log and off the screen.
+   */
+  if (err && err.code === "EADDRINUSE") {
+    log.info("another copy is already listening — nothing to do", { port: PORT });
+    process.exit(0);
+  }
   log.error("could not listen", { port: PORT, message: reason(err) });
   process.exit(1);
 });

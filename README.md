@@ -39,8 +39,8 @@ forget, and there is a test for it.
 ## Install
 
 In SOS POS: **Settings → Printer Settings → Download installer**. Run the downloaded
-`SOS Print Agent Setup.exe`, accept the one UAC prompt, done — the service is registered and
-started before the window closes, and the chip on the settings page turns green on its own.
+`SOS Print Agent Setup.exe`, accept the one UAC prompt, done — it starts straight away and the
+chip on the settings page turns green on its own.
 
 Nothing is configured during the install. Which printer prints what is set once per store in SOS
 POS, and every till in that store follows it.
@@ -57,7 +57,25 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 ```
 
-Both routes install the same service; use whichever suits the shop.
+Both routes install the same thing; use whichever suits the shop.
+
+### It runs in the logged-in session, not as a service
+
+It was a Windows service, and that failed on real hardware for two separate reasons — both
+caused by the service model, and both invisible until the packaged binary ran on a real machine:
+
+1. **Chromium will not launch under LocalSystem in session 0.** The failure is
+   `Failed to launch the browser process!` with no reason attached, so nothing prints and the log
+   says nothing useful.
+2. **Printers a person adds are per-user connections.** A LocalSystem service cannot see them, so
+   the printer a shop just installed would be missing from the dropdown while being plainly
+   visible in every other app on the same PC.
+
+Running in the user's session fixes both, and the agent is only wanted while somebody is using
+SOS POS in a browser on that machine — which is to say, while somebody is logged in. An HKLM
+`Run` entry starts it for whoever signs in, so one install covers every account on a shared
+counter. A second copy started by a second session exits quietly; loopback is per machine, so
+whichever got there first serves both.
 
 ### The installer is unsigned
 
@@ -68,7 +86,13 @@ security warning.
 
 ## What it renders with
 
-The Edge that is already on every Windows machine, driven headless over CDP. Nothing to download,
+The Edge that is already on every Windows machine, driven headless over CDP, and **SumatraPDF**
+(shipped beside the agent, GPLv3, licence included) to put the finished PDF on the spooler.
+
+SumatraPDF has to be a real file on disk. Bundled inside the agent's own binary — which is what
+`pdf-to-printer` effectively does once `pkg` swallows it — it cannot be executed at all, and
+fails with `spawn C:\snapshot\...\SumatraPDF.exe ENOENT` only once you run the built exe rather
+than `npm start`. Nothing to download,
 no Chromium in the installer, and it updates with the OS. Chrome is used instead if Edge is
 absent; `SOS_PRINT_BROWSER` overrides the search.
 
@@ -87,13 +111,13 @@ All on `http://127.0.0.1:9110`.
 
 | | |
 |---|---|
-| `GET /health` | `{ ok, version, renderer, host }`. `renderer: false` means no Edge or Chrome. |
+| `GET /health` | `{ ok, version, renderer, spooler, host }`. `renderer: false` means no Edge or Chrome; `spooler: false` means SumatraPDF is missing. |
 | `GET /printers` | `{ agentVersion, printers: [{ name, isDefault }] }` — this PC's installed printers. |
 | `POST /print` | `{ printerName, html, jobName?, copies? }` → `{ ok, jobId }`. |
 
 `POST /print` errors come back as `{ ok: false, error, detail }` with `error` one of
 `printer_required`, `nothing_to_print`, `printer_not_found`, `enumerate_failed`, `no_renderer`,
-`bad_pdf`, `spool_failed`, `unsupported_platform`.
+`bad_pdf`, `spool_failed`, `no_spooler`, `unsupported_platform`.
 
 `pdfBase64` is accepted in place of `html`, and nothing sends it today. It is the seam for
 rendering server-side later — one controlled Chromium for the whole fleet instead of whatever
@@ -116,18 +140,19 @@ None is needed. These exist for staging and for support:
 | `SOS_PRINT_LOG_DIR` | `%PROGRAMDATA%\SOSPrintAgent` |
 | `SOS_PRINT_MAX_BODY` | `12mb` |
 
-Set them in `sos-print-agent-service.xml` next to the exe, then re-run the installer.
+`SOS_PRINT_SUMATRA` overrides where the PDF viewer is looked for.
 
 ## When a till "just doesn't print"
 
 In order:
 
-1. `http://127.0.0.1:9110/health` in a browser on that PC. Nothing there means the service is not
-   running — `Get-Service SOSPrintAgent`.
+1. `http://127.0.0.1:9110/health` in a browser on that PC. Nothing there means it is not running
+   — check Task Manager for `sos-print-agent.exe`, and sign out and back in, since it starts at
+   logon.
 2. `%PROGRAMDATA%\SOSPrintAgent\agent.log`. Every job is one line, with the printer name and how
    long it took. Failures name the reason.
-3. `renderer: false` in `/health` means no Edge or Chrome. Nothing else will work until that is
-   fixed.
+3. `renderer: false` in `/health` means no Edge or Chrome; `spooler: false` means SumatraPDF is
+   not beside the agent. Neither can be fixed from the app — reinstall.
 4. `printer_not_found` in the log means the store's chosen printer is not installed on that PC
    under that name. That is not a fault — SOS POS asks the person which printer to use instead
    and remembers the answer for that till.

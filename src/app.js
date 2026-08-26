@@ -17,7 +17,7 @@ const express = require("express");
 const { ALLOWED_ORIGINS, MAX_BODY, VERSION } = require("./config");
 const log = require("./log");
 const { htmlToPdf, findBrowser } = require("./render");
-const { listPrinters, spool } = require("./printers");
+const { listPrinters, spool, findSumatra } = require("./printers");
 
 /**
  * Something readable out of anything thrown.
@@ -66,9 +66,11 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     version: VERSION,
-    // Absent means the one thing that cannot be fixed from the app: no Edge or Chrome to render
-    // with. Reported here so the chip can say so rather than waiting for a print to fail.
+    // The two things that cannot be fixed from the app: no Edge or Chrome to render with, and no
+    // PDF viewer to spool with. Reported here so the settings page can say so rather than waiting
+    // for a print to fail at a counter.
     renderer: Boolean(findBrowser()),
+    spooler: Boolean(findSumatra()),
     host: os.hostname(),
   });
 });
@@ -142,7 +144,7 @@ app.post("/print", (req, res) => {
       log.info("printed", { jobId, printerName, jobName: jobName || "", ms: Date.now() - started });
       res.json({ ok: true, jobId });
     } catch (err) {
-      const known = new Set(["no_renderer", "bad_pdf", "unsupported_platform"]);
+      const known = new Set(["no_renderer", "bad_pdf", "unsupported_platform", "no_spooler"]);
       const code = err && known.has(err.code) ? err.code : "spool_failed";
       log.error("print failed", { jobId, printerName, code, message: reason(err) });
       res.status(500).json({ ok: false, error: code, detail: reason(err) });

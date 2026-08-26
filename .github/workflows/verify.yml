@@ -37,16 +37,25 @@ jobs:
       - name: Build the exe
         run: npm run build
 
-      - name: Fetch the service host
+      - name: Fetch the PDF viewer that does the spooling
+        # A real file next to the agent, never inside it: a binary packaged into the exe's own
+        # virtual filesystem cannot be executed, which is how the first build failed with
+        # "spawn C:\snapshot\...\SumatraPDF.exe ENOENT" only once it ran as a packaged exe.
         run: |
-          $url = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe"
-          Invoke-WebRequest -Uri $url -OutFile dist/sos-print-agent-service.exe
+          $url = "https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2-64.zip"
+          Invoke-WebRequest -Uri $url -OutFile sumatra.zip
+          Expand-Archive sumatra.zip -DestinationPath sumatra-unzip -Force
+          $exe = Get-ChildItem sumatra-unzip -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "no exe inside the SumatraPDF download" }
+          Copy-Item $exe.FullName dist/SumatraPDF.exe
+          # GPLv3: ship the licence alongside it.
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/sumatrapdfreader/sumatrapdf/master/COPYING" -OutFile dist/SumatraPDF-LICENSE
+          Write-Host "SumatraPDF $((Get-Item dist/SumatraPDF.exe).Length) bytes"
 
       - name: Build the installer
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          Copy-Item installer/sos-print-agent.xml dist/sos-print-agent-service.xml
           $env:AGENT_VERSION = (Get-Content package.json | ConvertFrom-Json).version
           & $iscc installer/sos-print-agent.iss
           if (-not (Test-Path dist/SOS-Print-Agent-Setup.exe)) { throw "the installer was not produced" }
@@ -69,13 +78,16 @@ jobs:
           Write-Host "installer exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { throw "the installer failed with $($p.ExitCode)" }
 
-      - name: The service is registered, automatic, and running
+      - name: It is running, and set to start again at every logon
         run: |
-          $svc = Get-Service -Name SOSPrintAgent -ErrorAction Stop
-          $wmi = Get-CimInstance Win32_Service -Filter "Name='SOSPrintAgent'"
-          Write-Host "status=$($svc.Status) start=$($wmi.StartMode) account=$($wmi.StartName)"
-          if ($svc.Status -ne "Running") { throw "the service is $($svc.Status), not Running" }
-          if ($wmi.StartMode -ne "Auto") { throw "the service is $($wmi.StartMode), not Automatic — it would not survive a reboot" }
+          $proc = Get-Process -Name sos-print-agent -ErrorAction SilentlyContinue
+          if (-not $proc) { throw "the agent is not running after the install" }
+          Write-Host "running as pid $($proc.Id)"
+
+          # HKLM rather than HKCU, so one install covers every account that uses the till.
+          $run = Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "SOS Print Agent"
+          Write-Host "autostart: $($run.'SOS Print Agent')"
+          if (-not $run.'SOS Print Agent') { throw "no autostart entry — it would not come back after a reboot" }
 
       - name: It answers, and can see the printers on this PC
         run: |
@@ -86,6 +98,7 @@ jobs:
           if (-not $health.ok) { throw "no answer from the agent" }
           Write-Host "agent v$($health.version) renderer=$($health.renderer)"
           if (-not $health.renderer) { throw "the agent cannot find Edge or Chrome" }
+          if (-not $health.spooler) { throw "the agent cannot find SumatraPDF next to itself" }
 
           $printers = Invoke-RestMethod http://127.0.0.1:9110/printers -TimeoutSec 15
           Write-Host "printers: $($printers.printers.name -join ', ')"
@@ -167,15 +180,16 @@ jobs:
           if ($e3.error -ne "printer_not_found") { throw "unknown printer gave '$($e3.error)'" }
           Write-Host "printer_required / nothing_to_print / printer_not_found all correct"
 
-      - name: It survives being restarted, as it must across a reboot
+      - name: Starting a second copy is harmless
+        # Fast user switching means two sessions can both try. Loopback is per machine, so the
+        # second has nothing to do — it must exit quietly rather than pop an error at somebody.
         run: |
-          Restart-Service -Name SOSPrintAgent -Force
-          $ok = $false
-          foreach ($i in 1..20) {
-            try { if ((Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 2).ok) { $ok = $true; break } } catch { Start-Sleep -Seconds 1 }
-          }
-          if (-not $ok) { throw "the agent did not come back after a restart" }
-          Write-Host "came back after restart"
+          $second = Start-Process -FilePath "${env:ProgramFiles}\SOS Print Agent\sos-print-agent.exe" -PassThru
+          Start-Sleep -Seconds 5
+          if (-not $second.HasExited) { Stop-Process -Id $second.Id -Force; throw "the second copy did not stand down" }
+          if ($second.ExitCode -ne 0) { throw "the second copy exited with $($second.ExitCode) — that would show as an error" }
+          if (-not (Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 5).ok) { throw "the first copy stopped answering" }
+          Write-Host "second copy stood down cleanly, first still serving"
 
       - name: The log a shop would be asked to send exists
         if: always()
@@ -185,44 +199,18 @@ jobs:
           Write-Host "--- last 30 lines ---"
           Get-Content $log -Tail 30
 
-      - name: If the service could not print, try the same exe as a normal user
-        # Splits the two things that could be wrong. If this succeeds where the service failed,
-        # the problem is LocalSystem and session 0, not the packaged binary — and that is a
-        # different fix entirely.
-        if: failure()
-        run: |
-          Stop-Service SOSPrintAgent -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
-          $exe = Start-Process -FilePath "${env:ProgramFiles}\SOS Print Agent\sos-print-agent.exe" -PassThru -RedirectStandardOutput agent-stdout.txt -RedirectStandardError agent-stderr.txt
-          try {
-            foreach ($i in 1..20) {
-              try { if ((Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 2).ok) { break } } catch { Start-Sleep -Seconds 1 }
-            }
-            $html = '<!DOCTYPE html><html><head><style>@page{size:54mm 25.4mm;margin:0}</style></head><body>interactive<script>window.onload=function(){window.print();};</script></body></html>'
-            $body = @{ printerName = "SOS Test PDF"; html = $html; jobName = "interactive" } | ConvertTo-Json
-            $res = Invoke-WebRequest -Uri http://127.0.0.1:9110/print -Method Post -Body $body `
-                     -ContentType "application/json" -TimeoutSec 90 -SkipHttpErrorCheck -UseBasicParsing
-            Write-Host "INTERACTIVE PRINT (status $($res.StatusCode)): $($res.Content)"
-            Write-Host "running as: $(whoami)"
-            Write-Host "printers this account can see:"
-            Get-Printer | Select-Object -ExpandProperty Name
-          } finally {
-            Stop-Process -Id $exe.Id -Force -ErrorAction SilentlyContinue
-          }
-          Write-Host "--- stdout ---"; Get-Content agent-stdout.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
-          Write-Host "--- stderr ---"; Get-Content agent-stderr.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
-
       - name: Uninstalling leaves nothing behind
         run: |
           $uninst = Get-ChildItem "${env:ProgramFiles}\SOS Print Agent\unins*.exe" | Select-Object -First 1
           if (-not $uninst) { throw "no uninstaller in the install directory" }
-          $p = Start-Process -FilePath $uninst.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
-          Start-Sleep -Seconds 5
-          if (Get-Service -Name SOSPrintAgent -ErrorAction SilentlyContinue) { throw "the service is still registered after uninstall" }
-          try {
-            Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 3 | Out-Null
-            throw "something is still listening on 9110 after uninstall"
-          } catch [Microsoft.PowerShell.Commands.HttpResponseException] { throw "still answering after uninstall" } catch { }
+          Start-Process -FilePath $uninst.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait
+          Start-Sleep -Seconds 8
+
+          if (Get-Process -Name sos-print-agent -ErrorAction SilentlyContinue) { throw "the agent is still running after uninstall" }
+          $run = Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "SOS Print Agent" -ErrorAction SilentlyContinue
+          if ($run.'SOS Print Agent') { throw "the autostart entry survived the uninstall" }
+          $res = Invoke-WebRequest -Uri http://127.0.0.1:9110/health -TimeoutSec 3 -SkipHttpErrorCheck -UseBasicParsing -ErrorAction SilentlyContinue
+          if ($res) { throw "something is still listening on 9110 after uninstall" }
           Write-Host "clean"
 
       - name: Keep the evidence
