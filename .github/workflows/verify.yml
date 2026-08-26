@@ -155,14 +155,9 @@ jobs:
         # agent". If they change shape, the app shows the wrong advice.
         run: |
           function PrintErr($body) {
-            try {
-              Invoke-RestMethod http://127.0.0.1:9110/print -Method Post -Body ($body | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 60 | Out-Null
-              throw "expected a refusal, got success"
-            } catch [System.Net.WebException], [Microsoft.PowerShell.Commands.HttpResponseException] {
-              $stream = $_.Exception.Response.GetResponseStream()
-              $reader = New-Object System.IO.StreamReader($stream)
-              return ($reader.ReadToEnd() | ConvertFrom-Json)
-            }
+            $res = Invoke-WebRequest -Uri http://127.0.0.1:9110/print -Method Post -Body ($body | ConvertTo-Json) `
+                     -ContentType "application/json" -TimeoutSec 60 -SkipHttpErrorCheck -UseBasicParsing
+            return ($res.Content | ConvertFrom-Json)
           }
           $e1 = PrintErr @{ html = "<html><head></head><body>x</body></html>" }
           if ($e1.error -ne "printer_required") { throw "no printer name gave '$($e1.error)'" }
@@ -205,13 +200,12 @@ jobs:
             }
             $html = '<!DOCTYPE html><html><head><style>@page{size:54mm 25.4mm;margin:0}</style></head><body>interactive<script>window.onload=function(){window.print();};</script></body></html>'
             $body = @{ printerName = "SOS Test PDF"; html = $html; jobName = "interactive" } | ConvertTo-Json
-            try {
-              $res = Invoke-RestMethod http://127.0.0.1:9110/print -Method Post -Body $body -ContentType "application/json" -TimeoutSec 90
-              Write-Host "INTERACTIVE PRINT OK: $($res | ConvertTo-Json -Compress)"
-            } catch {
-              $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-              Write-Host "INTERACTIVE PRINT ALSO FAILED: $($reader.ReadToEnd())"
-            }
+            $res = Invoke-WebRequest -Uri http://127.0.0.1:9110/print -Method Post -Body $body `
+                     -ContentType "application/json" -TimeoutSec 90 -SkipHttpErrorCheck -UseBasicParsing
+            Write-Host "INTERACTIVE PRINT (status $($res.StatusCode)): $($res.Content)"
+            Write-Host "running as: $(whoami)"
+            Write-Host "printers this account can see:"
+            Get-Printer | Select-Object -ExpandProperty Name
           } finally {
             Stop-Process -Id $exe.Id -Force -ErrorAction SilentlyContinue
           }
