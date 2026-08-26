@@ -15,8 +15,10 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const puppeteer = require("puppeteer-core");
 const log = require("./log");
+const { LOG_DIR } = require("./config");
 
 /** Where Edge and Chrome actually live. First one present wins. */
 function candidatePaths() {
@@ -82,24 +84,67 @@ async function getBrowser() {
     throw err;
   }
 
+  /*
+   * An explicit profile directory, under ProgramData.
+   *
+   * The agent runs as a Windows service under LocalSystem, which has no desktop, no user profile
+   * and a temp directory of its own. Letting Chromium pick its own scratch space there is how you
+   * get "Failed to launch the browser process!" with no reason attached — which is exactly what a
+   * till reports as "it just doesn't print".
+   */
+  const profileDir = path.join(LOG_DIR, "browser-profile");
+  try {
+    fs.mkdirSync(profileDir, { recursive: true });
+  } catch {
+    /* fall back to Chromium's own choice rather than refusing to print */
+  }
+
   browserPromise = puppeteer.launch({
     executablePath,
     headless: true,
+    // The service has no console to inherit, and losing the browser's stderr is what turns a
+    // launch failure into "undefined". Piped, it reaches our own log instead.
+    dumpio: false,
     args: [
+      // Required under LocalSystem: Chromium refuses to run as a system account otherwise.
       "--no-sandbox",
+      "--disable-setuid-sandbox",
       "--disable-gpu",
       "--disable-dev-shm-usage",
+      `--user-data-dir=${profileDir}`,
+      `--crash-dumps-dir=${os.tmpdir()}`,
       // A till is not browsing. Nothing here should reach the network or keep state.
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-extensions",
       "--disable-background-networking",
       "--disable-sync",
+      "--disable-breakpad",
+      "--disable-crash-reporter",
     ],
   });
 
-  const browser = await browserPromise;
-  log.info("renderer started", { executablePath, version: await browser.version().catch(() => "?") });
+  let browser;
+  try {
+    browser = await browserPromise;
+  } catch (err) {
+    // Keep the real reason. Puppeteer's own message is often just "undefined" when the process
+    // dies before it can say anything, so the executable path and the account matter more.
+    browserPromise = null;
+    log.error("could not start the renderer", {
+      executablePath,
+      profileDir,
+      user: os.userInfo && os.userInfo().username,
+      message: String(err && err.message),
+    });
+    throw err;
+  }
+
+  log.info("renderer started", {
+    executablePath,
+    profileDir,
+    version: await browser.version().catch(() => "?"),
+  });
   return browser;
 }
 

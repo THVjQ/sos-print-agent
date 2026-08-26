@@ -183,11 +183,40 @@ jobs:
           Write-Host "came back after restart"
 
       - name: The log a shop would be asked to send exists
+        if: always()
         run: |
           $log = "$env:ProgramData\SOSPrintAgent\agent.log"
           if (-not (Test-Path $log)) { throw "no log at $log" }
           Write-Host "--- last 30 lines ---"
           Get-Content $log -Tail 30
+
+      - name: If the service could not print, try the same exe as a normal user
+        # Splits the two things that could be wrong. If this succeeds where the service failed,
+        # the problem is LocalSystem and session 0, not the packaged binary — and that is a
+        # different fix entirely.
+        if: failure()
+        run: |
+          Stop-Service SOSPrintAgent -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          $exe = Start-Process -FilePath "${env:ProgramFiles}\SOS Print Agent\sos-print-agent.exe" -PassThru -RedirectStandardOutput agent-stdout.txt -RedirectStandardError agent-stderr.txt
+          try {
+            foreach ($i in 1..20) {
+              try { if ((Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 2).ok) { break } } catch { Start-Sleep -Seconds 1 }
+            }
+            $html = '<!DOCTYPE html><html><head><style>@page{size:54mm 25.4mm;margin:0}</style></head><body>interactive<script>window.onload=function(){window.print();};</script></body></html>'
+            $body = @{ printerName = "SOS Test PDF"; html = $html; jobName = "interactive" } | ConvertTo-Json
+            try {
+              $res = Invoke-RestMethod http://127.0.0.1:9110/print -Method Post -Body $body -ContentType "application/json" -TimeoutSec 90
+              Write-Host "INTERACTIVE PRINT OK: $($res | ConvertTo-Json -Compress)"
+            } catch {
+              $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+              Write-Host "INTERACTIVE PRINT ALSO FAILED: $($reader.ReadToEnd())"
+            }
+          } finally {
+            Stop-Process -Id $exe.Id -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "--- stdout ---"; Get-Content agent-stdout.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
+          Write-Host "--- stderr ---"; Get-Content agent-stderr.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
 
       - name: Uninstalling leaves nothing behind
         run: |
