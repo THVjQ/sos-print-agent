@@ -145,6 +145,38 @@ jobs:
           if ($res.Headers["Access-Control-Allow-Origin"] -ne "https://app.sospos.com.au") { throw "the origin was not allowed" }
           Write-Host "preflight ok"
 
+      - name: Restart the agent the way a logon does
+        # The one thing a runner cannot be: a machine somebody is signed in to.
+        #
+        # The installer hands the agent to Explorer, so that on a till it starts **de-elevated in
+        # the user's own session** — the fix this release exists for. A runner has no interactive
+        # session for it to land in, and Edge will not start for a process that has no desktop:
+        # "Failed to launch the browser process!" with nothing after it. That is the same sentence
+        # this release is about and entirely the wrong reason for it, so printing has to be tested
+        # from a process that has a session.
+        #
+        # On a till, Windows starts the agent from the HKLM Run entry at logon and that session is
+        # real. Nothing here reproduces it. Being a child of this step is the closest available —
+        # and it is exactly what the rendering step further up already ran as. So what follows
+        # proves the agent prints; that the *installer's* launch lands in the right session is
+        # proved at the counter, by /health reporting elevated: false.
+        run: |
+          Get-Process -Name sos-print-agent -ErrorAction SilentlyContinue | Stop-Process -Force
+          # Its headless Edge does not go with it — the browser is a child process and Stop-Process
+          # is not the SIGTERM the agent shuts down on. Left alive it holds the profile lock.
+          Get-CimInstance Win32_Process |
+            Where-Object { $_.Name -eq "msedge.exe" -and $_.CommandLine -like "*SOSPrintAgent*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Start-Sleep -Seconds 3
+
+          Start-Process -FilePath "${env:ProgramFiles}\SOS Print Agent\sos-print-agent.exe" | Out-Null
+          $health = $null
+          foreach ($i in 1..20) {
+            try { $health = Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 2; break } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $health.ok) { throw "the agent did not come back after being restarted" }
+          Write-Host "agent v$($health.version) back up, elevated=$($health.elevated)"
+
       - name: A sticker actually comes out of the printer
         run: |
           Remove-Item C:\sos-test\out.pdf -ErrorAction SilentlyContinue
