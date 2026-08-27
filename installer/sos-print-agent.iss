@@ -198,19 +198,27 @@ begin
       Health := AgentHealth();
     end;
 
+    { `SuppressibleMsgBox`, never plain `MsgBox`.
+
+      Only this one honours /SUPPRESSMSGBOXES and returns the default answer instead of showing
+      anything. A plain MsgBox in a silent install puts a modal dialog on a desktop nobody is
+      looking at, and Setup waits on it for ever — a scripted or MDM install that simply never
+      returns, which is a failure this project has already paid for once (706814a). The dialog
+      below had never fired on a runner until this release gave it something to say, and it hung
+      the first build. }
     if Health = '' then
-      MsgBox('The print agent was installed but is not answering yet.' + #13#10#13#10 +
+      SuppressibleMsgBox('The print agent was installed but is not answering yet.' + #13#10#13#10 +
              'Sign out and back in, then open SOS POS, go to Settings then Printer Settings, ' +
              'and press Recheck. If it still says not detected, send us ' +
              ExpandConstant('{commonappdata}\SOSPrintAgent\agent.log') + '.',
-             mbInformation, MB_OK)
+             mbInformation, MB_OK, IDOK)
     else if Pos('"elevated":true', Health) > 0 then
       { Explorer was not there to launch it de-elevated, so it inherited Setup's rights. It will
         answer, list printers, and fail every print until it is restarted as a normal user. }
-      MsgBox('The print agent is running, but with administrator rights, and it cannot print ' +
+      SuppressibleMsgBox('The print agent is running, but with administrator rights, and it cannot print ' +
              'that way.' + #13#10#13#10 +
              'Sign out of Windows and back in. It starts by itself, correctly, and printing ' +
              'will work from then on — nothing to reinstall.',
-             mbInformation, MB_OK);
+             mbInformation, MB_OK, IDOK);
   end;
 end;
