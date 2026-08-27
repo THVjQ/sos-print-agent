@@ -41,6 +41,10 @@ test("health says it is alive, and which version", () =>
     assert.equal(body.ok, true);
     assert.match(body.version, /^\d+\.\d+\.\d+$/);
     assert.equal(typeof body.renderer, "boolean");
+    // The settings page reads this to tell a shop "sign out and back in": an agent started by the
+    // elevated installer answers everything else here and still cannot print, because Edge will
+    // not run as administrator. A field that went missing would read as "not elevated".
+    assert.equal(typeof body.elevated, "boolean");
   }));
 
 test("every response carries the Private Network Access header", () =>

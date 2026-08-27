@@ -14,7 +14,7 @@ const path = require("path");
 const crypto = require("crypto");
 const express = require("express");
 
-const { ALLOWED_ORIGINS, MAX_BODY, VERSION } = require("./config");
+const { ALLOWED_ORIGINS, ELEVATED, MAX_BODY, VERSION } = require("./config");
 const log = require("./log");
 const { htmlToPdf, findBrowser } = require("./render");
 const { listPrinters, spool, findSumatra } = require("./printers");
@@ -71,6 +71,10 @@ app.get("/health", (req, res) => {
     // for a print to fail at a counter.
     renderer: Boolean(findBrowser()),
     spooler: Boolean(findSumatra()),
+    // The third way a healthy-looking agent cannot print: started elevated, where Edge refuses to
+    // run. Everything else here says yes and every print still fails, so the settings page needs
+    // to be able to say "sign out and back in" instead of a shop guessing.
+    elevated: ELEVATED,
     host: os.hostname(),
   });
 });

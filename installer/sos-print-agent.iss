@@ -49,6 +49,21 @@ Source: "..\dist\SumatraPDF.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\SumatraPDF-LICENSE";  DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\README.md";                DestDir: "{app}"; Flags: ignoreversion
 
+[InstallDelete]
+; The service that 1.0.0 installed. `PrepareToInstall` stops and deregisters it; these are the
+; files it leaves behind, which would otherwise sit in Program Files looking installed for ever.
+Type: files; Name: "{app}\sos-print-agent-service.exe"
+Type: files; Name: "{app}\sos-print-agent-service.xml"
+Type: files; Name: "{app}\sos-print-agent-service.wrapper.log"
+Type: files; Name: "{app}\sos-print-agent-service.out.log"
+Type: files; Name: "{app}\sos-print-agent-service.err.log"
+; The browser profile 1.1.0 and earlier kept under ProgramData. Left there it is worse than
+; useless: created by an elevated install or by LocalSystem, it belongs to Administrators or
+; SYSTEM, and the standard user the agent now runs as cannot write a file into it — Chromium dies
+; without saying why. The agent keeps its profile under the user's own LOCALAPPDATA from 1.1.1 on,
+; so nothing needs this copy. Removed here, while Setup still has the rights to remove it.
+Type: filesandordirs; Name: "{commonappdata}\SOSPrintAgent\browser-profile"
+
 [Registry]
 ; HKLM rather than HKCU: one install covers every account that uses the till, which is what a
 ; shop with a shared counter actually has.
@@ -56,27 +71,90 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
   ValueName: "SOS Print Agent"; ValueData: """{app}\sos-print-agent.exe"""; Flags: uninsdeletevalue
 
 [Run]
-; Started now as well as at next logon, so the shop does not have to reboot to try it.
+; Started now as well as at next logon, so the shop does not have to reboot to try it — but
+; started *through Explorer*, which is the whole point of this line.
 ;
-; Not `runasoriginaluser`: that needs an interactive session token to hand the process to, and on
-; a machine where the installer is running without one it blocks for ever rather than failing —
-; a silent install that simply never returns. UAC elevates in place, so the plain form already
-; lands in the right session; it inherits elevation, which costs nothing here.
-Filename: "{app}\sos-print-agent.exe"; Flags: nowait
+; Setup is elevated, and a child of Setup inherits that. An elevated agent looks perfectly healthy
+; — it answers /health and lists printers — and then cannot print a single thing, because **Edge
+; refuses to run as administrator**: it re-launches itself de-elevated and the process puppeteer
+; is holding exits 0 immediately, with no output. The log fills with `Failed to launch the browser
+; process!` and nothing after it. That is what a till reported after the 1.1.0 install, on every
+; print, until the next sign-out.
+;
+; `runasoriginaluser` is the documented answer and cannot be used: it needs an interactive session
+; token to hand the process to, and where there is none it blocks for ever rather than failing — a
+; silent install that never returns. Explorer already runs at medium integrity, so handing it the
+; path launches the agent de-elevated and returns straight away. With no interactive session
+; nothing starts, which is correct for an MDM push: the HKLM Run entry covers the next logon.
+Filename: "{win}\explorer.exe"; Parameters: """{app}\sos-print-agent.exe"""; Flags: nowait
 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM sos-print-agent.exe"; Flags: runhidden; RunOnceId: "StopAgent"
+; And the headless Edge it was driving. Killing the agent does not take it with it — the browser
+; is a child process, and SIGINT/SIGTERM, which is what the agent shuts down cleanly on, is not
+; what taskkill sends. Left alive it holds the profile lock and keeps a few hundred MB.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+  Parameters: "-NoProfile -NonInteractive -Command ""Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'msedge.exe' -and ($_.CommandLine -like '*SOSPrintAgent*' -or $_.CommandLine -like '*sos-print-agent*') } | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }"""; \
+  Flags: runhidden; RunOnceId: "StopRenderer"
+
+[UninstallDelete]
+; The profile, but never the logs — a shop uninstalling is usually a shop about to be asked what
+; the log says. {localappdata} is the uninstalling user's, so on a shared counter another
+; account's profile survives; it is a few MB of scratch space in that user's own temp-ish area,
+; and hunting through every profile on the machine to delete it is not worth what it would risk.
+Type: filesandordirs; Name: "{localappdata}\SOSPrintAgent"
 
 [Code]
+procedure RunHidden(const FileName, Params: String);
+var
+  ResultCode: Integer;
+begin
+  { Every one of these is "remove it if it is there". A machine that never had the old version,
+    or has nothing running, gives a non-zero exit code and that is the normal case — so the
+    result is deliberately ignored rather than failing an install over it. }
+  Exec(FileName, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+{ Everything the previous install left running, cleared before a byte is copied.
+
+  Upgrading in place is otherwise not enough. 1.0.0 registered a Windows *service*, and a service
+  left behind keeps starting a `sos-print-agent.exe` that is no longer there to be started — or
+  worse, starts the new one as LocalSystem, where Chromium will not launch and no per-user printer
+  is visible. And in any version, killing the agent orphans the headless Edge it was driving,
+  which goes on holding the browser profile's lock. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+
+  { The 1.0.0 service. `sc stop` then `sc delete`, rather than the WinSW exe's own `uninstall`,
+    because that exe may already have been removed by hand. }
+  RunHidden(ExpandConstant('{sys}\sc.exe'), 'stop SOSPrintAgent');
+  RunHidden(ExpandConstant('{sys}\sc.exe'), 'delete SOSPrintAgent');
+
+  { The running agent — including one still running elevated from a previous install of 1.1.0,
+    which is the state this whole release exists to get a till out of. }
+  RunHidden(ExpandConstant('{sys}\taskkill.exe'), '/F /IM sos-print-agent.exe');
+
+  { Its headless Edge. Matched on the command line rather than the image name: a shop's own Edge
+    windows are msedge.exe too, and closing somebody's browser mid-sale would be a far worse bug
+    than the one being fixed. Only a process whose --user-data-dir is ours is touched. }
+  RunHidden(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq ''msedge.exe'' -and ($_.CommandLine -like ''*SOSPrintAgent*'' -or $_.CommandLine -like ''*sos-print-agent*'') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"');
+
+  { Program Files holds the exe open for a moment after the process goes; copying over it too
+    early fails with an error that reads like a permissions problem. }
+  Sleep(2000);
+end;
+
 { The install is finished but the agent takes a second or two to answer. Confirming it really
   responds — rather than just reporting "installed" — is the difference between a shop that knows
   it worked and one that finds out at the counter. }
-function AgentAnswers(): Boolean;
+function AgentHealth(): String;
 var
   WinHttp: Variant;
   Attempt: Integer;
 begin
-  Result := False;
+  Result := '';
   for Attempt := 1 to 15 do
   begin
     try
@@ -85,7 +163,10 @@ begin
       WinHttp.Send();
       if WinHttp.Status = 200 then
       begin
-        Result := True;
+        { The body, not just "it answered". `elevated` is the one fault that answers 200 and
+          still cannot print, and the shop should hear about it here rather than at the counter. }
+        Result := WinHttp.ResponseText;
+        if Result = '' then Result := '{}';
         Exit;
       end;
     except
@@ -96,14 +177,40 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Health: String;
+  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
-    if not AgentAnswers() then
+    Health := AgentHealth();
+
+    if Health = '' then
+    begin
+      { Explorer had nothing to hand it to.
+        On a machine being imaged, pushed to by MDM, or built by CI there is no interactive shell,
+        so the de-elevated launch above starts nothing at all. Leaving the till with no agent
+        running would be a worse outcome than an elevated one — an elevated agent at least
+        answers, lists printers, and says `elevated` so the fault has a name. So: start it
+        directly, and let the check below do the talking. }
+      Exec(ExpandConstant('{app}\sos-print-agent.exe'), '', ExpandConstant('{app}'),
+           SW_HIDE, ewNoWait, ResultCode);
+      Health := AgentHealth();
+    end;
+
+    if Health = '' then
       MsgBox('The print agent was installed but is not answering yet.' + #13#10#13#10 +
              'Sign out and back in, then open SOS POS, go to Settings then Printer Settings, ' +
              'and press Recheck. If it still says not detected, send us ' +
              ExpandConstant('{commonappdata}\SOSPrintAgent\agent.log') + '.',
+             mbInformation, MB_OK)
+    else if Pos('"elevated":true', Health) > 0 then
+      { Explorer was not there to launch it de-elevated, so it inherited Setup's rights. It will
+        answer, list printers, and fail every print until it is restarted as a normal user. }
+      MsgBox('The print agent is running, but with administrator rights, and it cannot print ' +
+             'that way.' + #13#10#13#10 +
+             'Sign out of Windows and back in. It starts by itself, correctly, and printing ' +
+             'will work from then on — nothing to reinstall.',
              mbInformation, MB_OK);
   end;
 end;

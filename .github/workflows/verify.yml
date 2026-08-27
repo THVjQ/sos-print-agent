@@ -119,9 +119,13 @@ jobs:
             try { $health = Invoke-RestMethod http://127.0.0.1:9110/health -TimeoutSec 2; break } catch { Start-Sleep -Seconds 1 }
           }
           if (-not $health.ok) { throw "no answer from the agent" }
-          Write-Host "agent v$($health.version) renderer=$($health.renderer)"
+          Write-Host "agent v$($health.version) renderer=$($health.renderer) elevated=$($health.elevated)"
           if (-not $health.renderer) { throw "the agent cannot find Edge or Chrome" }
           if (-not $health.spooler) { throw "the agent cannot find SumatraPDF next to itself" }
+          # Reported, not asserted. A runner has UAC out of the way, so an elevated agent still
+          # prints here — on a real till it cannot, which is the whole reason this field exists.
+          # That it is *present* is asserted: SOS POS reads it to say "sign out and back in".
+          if ($null -eq $health.elevated) { throw "/health no longer reports 'elevated' — the app reads it" }
 
           $printers = Invoke-RestMethod http://127.0.0.1:9110/printers -TimeoutSec 15
           Write-Host "printers: $($printers.printers.name -join ', ')"
@@ -185,6 +189,26 @@ jobs:
             if (-not $res.ok) { throw "batch job $n refused" }
             Write-Host "batch $n ok"
           }
+
+      - name: The renderer's profile is per-user, and not in ProgramData
+        # The regression that cost a till a day of not printing. A profile under ProgramData is
+        # created by the elevated installer, so it belongs to Administrators, and the standard
+        # user the agent runs as can make folders inside it but not files — Chromium dies before
+        # it can say why and every print fails with an empty error. Asserted after real prints
+        # have happened, so the directory being checked is one the renderer actually used.
+        run: |
+          $stale = "$env:ProgramData\SOSPrintAgent\browser-profile"
+          if (Test-Path $stale) { throw "the renderer put its profile back under ProgramData: $stale" }
+
+          $mine = "$env:LOCALAPPDATA\SOSPrintAgent\browser-profile"
+          if (-not (Test-Path $mine)) { throw "no browser profile at $mine — did it fall back to a temporary one?" }
+          Write-Host "profile at $mine, $((Get-ChildItem $mine -Recurse -ErrorAction SilentlyContinue).Count) items"
+
+          # And the fallback did not have to be used, which would mean the proper path was
+          # unwritable — it prints either way, so only the log says so.
+          $log = Get-Content "$env:ProgramData\SOSPrintAgent\agent.log" -Raw
+          if ($log -match "cannot write to the browser profile directory") { throw "the agent fell back to a temporary profile" }
+          if ($log -match "could not start the renderer") { throw "the renderer failed to launch at least once" }
 
       - name: The failures fail the way the app expects
         # These error codes are what SOS POS turns into "choose a printer" or "install the

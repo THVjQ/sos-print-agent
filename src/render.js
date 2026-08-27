@@ -18,7 +18,7 @@ const path = require("path");
 const os = require("os");
 const puppeteer = require("puppeteer-core");
 const log = require("./log");
-const { LOG_DIR } = require("./config");
+const { BROWSER_PROFILE_DIR, ELEVATED } = require("./config");
 
 /** Where Edge and Chrome actually live. First one present wins. */
 function candidatePaths() {
@@ -60,6 +60,62 @@ function findBrowser() {
 }
 
 /**
+ * A directory Chromium can actually keep a profile in.
+ *
+ * `mkdir` succeeding is not the question — under ProgramData a standard user may create folders
+ * and still not be allowed to create a file inside one. So the probe writes a file, which is what
+ * Chromium is about to do. Getting this wrong is silent: Chromium exits before it opens its
+ * logging, and puppeteer reports a launch failure with an empty reason.
+ */
+function usableProfileDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, ".write-test");
+    fs.writeFileSync(probe, "");
+    fs.unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The profile used when the proper one cannot be written to.
+ *
+ * A fixed name rather than a fresh temp directory each time, so a till that has fallen back keeps
+ * one warm browser instead of leaving a new profile behind on every print.
+ */
+const FALLBACK_PROFILE_DIR = path.join(os.tmpdir(), "sos-print-agent-profile");
+
+/**
+ * @param verbose turns on Chromium's own logging, to stderr, where puppeteer is already reading.
+ *   Off for normal launches — it is thousands of lines an hour that nobody reads. On for the
+ *   second attempt, because puppeteer's message carries whatever the browser wrote, and without
+ *   it a launch that fails early says literally nothing: `Failed to launch the browser process!`
+ *   and then a blank line. That blank line is what a support call has to work from otherwise.
+ */
+function launchArgs(profileDir, verbose) {
+  return [
+    // Chromium refuses to run as a system account without these, and they cost nothing here.
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    `--user-data-dir=${profileDir}`,
+    `--crash-dumps-dir=${os.tmpdir()}`,
+    // A till is not browsing. Nothing here should reach the network or keep state.
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-breakpad",
+    "--disable-crash-reporter",
+    ...(verbose ? ["--enable-logging=stderr", "--v=1"] : []),
+  ];
+}
+
+/**
  * One browser, kept warm.
  *
  * Starting Chromium costs about a second. Doing that per label would make printing a run of
@@ -68,6 +124,30 @@ function findBrowser() {
  * browser so two prints arriving together share one launch instead of racing to start two.
  */
 let browserPromise = null;
+
+async function start(executablePath, profileDir, verbose) {
+  browserPromise = puppeteer.launch({
+    executablePath,
+    headless: true,
+    dumpio: false,
+    args: launchArgs(profileDir, verbose),
+  });
+
+  let browser;
+  try {
+    browser = await browserPromise;
+  } catch (err) {
+    browserPromise = null;
+    throw err;
+  }
+
+  log.info("renderer started", {
+    executablePath,
+    profileDir,
+    version: await browser.version().catch(() => "?"),
+  });
+  return browser;
+}
 
 async function getBrowser() {
   if (browserPromise) {
@@ -84,68 +164,66 @@ async function getBrowser() {
     throw err;
   }
 
-  /*
-   * An explicit profile directory, under ProgramData.
-   *
-   * The agent runs as a Windows service under LocalSystem, which has no desktop, no user profile
-   * and a temp directory of its own. Letting Chromium pick its own scratch space there is how you
-   * get "Failed to launch the browser process!" with no reason attached — which is exactly what a
-   * till reports as "it just doesn't print".
-   */
-  const profileDir = path.join(LOG_DIR, "browser-profile");
-  try {
-    fs.mkdirSync(profileDir, { recursive: true });
-  } catch {
-    /* fall back to Chromium's own choice rather than refusing to print */
+  let profileDir = BROWSER_PROFILE_DIR;
+  if (!usableProfileDir(profileDir)) {
+    log.warn("cannot write to the browser profile directory — using a temporary one", {
+      wanted: profileDir,
+      using: FALLBACK_PROFILE_DIR,
+    });
+    profileDir = FALLBACK_PROFILE_DIR;
   }
 
-  browserPromise = puppeteer.launch({
-    executablePath,
-    headless: true,
-    // The service has no console to inherit, and losing the browser's stderr is what turns a
-    // launch failure into "undefined". Piped, it reaches our own log instead.
-    dumpio: false,
-    args: [
-      // Required under LocalSystem: Chromium refuses to run as a system account otherwise.
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-      `--user-data-dir=${profileDir}`,
-      `--crash-dumps-dir=${os.tmpdir()}`,
-      // A till is not browsing. Nothing here should reach the network or keep state.
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--disable-sync",
-      "--disable-breakpad",
-      "--disable-crash-reporter",
-    ],
-  });
-
-  let browser;
   try {
-    browser = await browserPromise;
+    return await start(executablePath, profileDir, false);
   } catch (err) {
-    // Keep the real reason. Puppeteer's own message is often just "undefined" when the process
-    // dies before it can say anything, so the executable path and the account matter more.
-    browserPromise = null;
+    // Puppeteer's own message is "undefined" when the browser exits with a code, and empty when
+    // it exits cleanly without ever opening its debugging port — so the path, the account and
+    // whether we are elevated carry more than the message does.
     log.error("could not start the renderer", {
       executablePath,
       profileDir,
       user: os.userInfo && os.userInfo().username,
+      elevated: ELEVATED,
       message: String(err && err.message),
     });
-    throw err;
-  }
 
-  log.info("renderer started", {
-    executablePath,
-    profileDir,
-    version: await browser.version().catch(() => "?"),
-  });
-  return browser;
+    if (ELEVATED) {
+      log.error(
+        "the agent is running as administrator — Edge will not run elevated, it re-launches " +
+          "itself de-elevated and the process we are holding exits immediately. Sign out and " +
+          "back in so the agent starts from the logon entry as a normal user.",
+      );
+    }
+
+    /*
+     * One more attempt, on a throwaway profile, with the browser's own logging on.
+     *
+     * It fixes the two failures that are about the profile and not the browser — one that cannot
+     * be written to, and one still locked by a headless Edge orphaned when the agent was killed —
+     * and when it fails anyway, it fails *loudly*: whatever Chromium wrote is inside this second
+     * message, where the first had nothing at all.
+     */
+    const retryDir =
+      profileDir === FALLBACK_PROFILE_DIR
+        ? path.join(os.tmpdir(), `sos-print-agent-profile-${process.pid}`)
+        : FALLBACK_PROFILE_DIR;
+
+    try {
+      const browser = await start(executablePath, retryDir, true);
+      log.warn("renderer started on a second attempt — the usual profile could not be used", {
+        wanted: profileDir,
+        using: retryDir,
+      });
+      return browser;
+    } catch (retryErr) {
+      log.error("the renderer would not start on a fresh profile either", {
+        profileDir: retryDir,
+        message: String(retryErr && retryErr.message),
+      });
+      // The first failure is the one that describes the till's actual state.
+      throw err;
+    }
+  }
 }
 
 const PX_PER_MM = 96 / 25.4;

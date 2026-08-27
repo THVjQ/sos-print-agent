@@ -14,7 +14,16 @@
  */
 
 const { app, reason } = require("./app");
-const { HOST, PORT, ALLOWED_ORIGINS, LOG_DIR, AUTO_UPDATE, VERSION } = require("./config");
+const {
+  HOST,
+  PORT,
+  ALLOWED_ORIGINS,
+  LOG_DIR,
+  BROWSER_PROFILE_DIR,
+  ELEVATED,
+  AUTO_UPDATE,
+  VERSION,
+} = require("./config");
 const { findBrowser, closeRenderer } = require("./render");
 const log = require("./log");
 
@@ -23,10 +32,26 @@ const server = app.listen(PORT, HOST, () => {
     allowedOrigins: ALLOWED_ORIGINS,
     renderer: findBrowser() || "NOT FOUND",
     logDir: LOG_DIR,
+    profileDir: BROWSER_PROFILE_DIR,
+    elevated: ELEVATED,
     autoUpdate: AUTO_UPDATE,
   });
   if (!findBrowser()) {
     log.error("no Edge or Chrome on this machine — /print will fail with no_renderer");
+  }
+  /*
+   * Said at startup, not only when a print fails.
+   *
+   * An elevated agent answers /health, lists printers and looks entirely healthy on the settings
+   * page — and then cannot render anything, because Edge will not run as administrator. The one
+   * way it happens is the installer starting the agent inside its own elevated session, which is
+   * exactly when a shop first tries to print. Signing out and back in starts it properly.
+   */
+  if (ELEVATED) {
+    log.warn(
+      "running as administrator — Edge will not launch from an elevated process, so printing " +
+        "will fail until this is restarted as a normal user. Sign out and back in.",
+    );
   }
 });
 

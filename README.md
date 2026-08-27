@@ -77,6 +77,14 @@ SOS POS in a browser on that machine — which is to say, while somebody is logg
 counter. A second copy started by a second session exits quietly; loopback is per machine, so
 whichever got there first serves both.
 
+**And not elevated, either.** Setup runs as administrator, and a process it starts inherits that;
+1.1.0 started the agent that way and the first till it reached could not print a single thing
+until the next sign-out. **Edge refuses to run as administrator** — it re-launches itself
+de-elevated, and the process the agent is holding exits immediately, cleanly, with no output at
+all. Everything else looks perfect: `/health` answers, printers list, and every job fails. So the
+installer now hands the path to `explorer.exe`, which already runs at medium integrity, and the
+agent reports `elevated` in `/health` so the fault can be named instead of guessed at.
+
 ### The installer is unsigned
 
 Windows SmartScreen will say *"Windows protected your PC"* and hide the Run button behind **More
@@ -137,7 +145,8 @@ None is needed. These exist for staging and for support:
 | `SOS_PRINT_PORT` | `9110` |
 | `SOS_PRINT_ALLOWED_ORIGINS` | `https://app.sospos.com.au`, `https://staging.sospos.com.au`, `http://localhost:3000`, `http://127.0.0.1:3000` |
 | `SOS_PRINT_BROWSER` | first Edge, then Chrome, in the usual install locations |
-| `SOS_PRINT_LOG_DIR` | `%PROGRAMDATA%\SOSPrintAgent` |
+| `SOS_PRINT_LOG_DIR` | `%PROGRAMDATA%\SOSPrintAgent` — one log per machine, whoever is signed in |
+| `SOS_PRINT_PROFILE_DIR` | `%LOCALAPPDATA%\SOSPrintAgent\browser-profile` — per user, and it has to be |
 | `SOS_PRINT_MAX_BODY` | `12mb` |
 
 `SOS_PRINT_SUMATRA` overrides where the PDF viewer is looked for.
@@ -152,10 +161,32 @@ In order:
 2. `%PROGRAMDATA%\SOSPrintAgent\agent.log`. Every job is one line, with the printer name and how
    long it took. Failures name the reason.
 3. `renderer: false` in `/health` means no Edge or Chrome; `spooler: false` means SumatraPDF is
-   not beside the agent. Neither can be fixed from the app — reinstall.
+   not beside the agent. Neither can be fixed from the app — reinstall. **`elevated: true` means
+   it is running as administrator and cannot print at all** — see below.
 4. `printer_not_found` in the log means the store's chosen printer is not installed on that PC
    under that name. That is not a fault — SOS POS asks the person which printer to use instead
    and remembers the answer for that till.
+
+### `Failed to launch the browser process!` with nothing after it
+
+Worth knowing exactly, because the same sentence covers several different faults and the empty
+space after it is the clue. Puppeteer builds the message as the sentence, then whatever the
+browser wrote to stderr, then the troubleshooting link:
+
+- **`...process! undefined`** — the browser exited with a failure code. That is the session-0
+  failure: an agent running as LocalSystem, which this no longer does.
+- **`...process!` and then a blank line** — the browser started, exited **cleanly**, and wrote
+  nothing at all. It did not crash; it walked away. Two things do that:
+  1. **The agent is running elevated.** Edge will not run as administrator: it re-launches itself
+     de-elevated and the process being held exits 0 immediately. `elevated: true` in `/health`
+     says so. Fix: sign out of Windows and back in, so the agent starts from the `Run` entry as a
+     normal user. Nothing to reinstall.
+  2. **It cannot write its profile**, or something else still owns it — an Edge orphaned when the
+     agent was force-killed keeps the lock. The agent now falls back to a temporary profile and
+     prints anyway, logging `cannot write to the browser profile directory`.
+- **`...process!` followed by real Chromium output** — a genuine browser fault, and the lines
+  say what it is. The agent only turns its own logging on for the retry, so this is a second
+  attempt's message.
 
 ## Updating
 
@@ -163,6 +194,32 @@ Self-update is deliberately **off**. A binary that replaces itself across 26 sho
 part of this that can break every counter at once, so a new version is an installer run until a
 pilot store has been on a fixed version long enough to trust it. `SOS_PRINT_AUTOUPDATE=on` is
 reserved for that decision and does nothing yet.
+
+### Installing over an old version
+
+Just run the new installer. Nothing needs uninstalling first, and there is no version to hunt
+down and remove by hand — the installer shares an AppId with every previous build, so Windows
+treats it as an upgrade of the same application rather than a second copy, and Add/Remove
+Programs keeps showing one entry.
+
+What it clears out on the way, because an upgrade in place is not enough on a till that has had
+an earlier build:
+
+| Left by | Cleared |
+|---|---|
+| 1.0.0 | the `SOSPrintAgent` **Windows service** — stopped and deregistered, and its `sos-print-agent-service.*` files deleted. A service left registered goes on starting the agent as LocalSystem, where Chromium will not launch and per-user printers are invisible |
+| ≤1.1.0 | the browser profile under `%PROGRAMDATA%\SOSPrintAgent\browser-profile`. Created by an elevated install or by LocalSystem, so a standard user cannot write into it — which is the bug 1.1.1 fixes. The profile now lives under the user's own `%LOCALAPPDATA%` |
+| any version | the running `sos-print-agent.exe`, and the headless Edge it was driving. Killing the agent does not take the browser with it, and the orphan holds the profile lock |
+
+Only an `msedge.exe` whose command line points at our own profile is touched — a shop's Edge
+windows are `msedge.exe` too, and closing somebody's browser mid-sale would be worse than the bug
+being fixed.
+
+**Logs are never deleted**, by an upgrade or by an uninstall. They are usually the reason somebody
+is reinstalling.
+
+To remove it entirely: Add/Remove Programs, or `install.ps1 -Uninstall`. Printing in SOS POS falls
+back to the browser's print dialog, which is what shops did before this existed.
 
 ## Development
 
