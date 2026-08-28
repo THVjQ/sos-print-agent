@@ -614,10 +614,8 @@ async function htmlToPdf(html) {
       // viewport gave every receipt the same 264mm, which is the viewport, not the content.
       await page.setViewport({ width: Math.max(1, Math.round(autoWidthMm * PX_PER_MM)), height: 1 });
     }
-    await page.evaluateOnNewDocument(() => {
-      window.print = function () {};
-      window.close = function () {};
-    });
+    // A STRING, not a function — see the note on the height measurement below. Same reason.
+    await page.evaluateOnNewDocument("window.print=function(){};window.close=function(){};");
 
     // `load` rather than `networkidle`: these documents are self-contained — images arrive as
     // data URIs — so there is no network to go idle, and waiting for it costs half a second per
@@ -635,7 +633,24 @@ async function htmlToPdf(html) {
       // came out. Margins stay at zero here as they do on the fixed-size path: every one of these
       // templates already insets itself with padding on `body`, and applying the `@page` margin
       // as well would inset it twice.
-      const heightPx = await page.evaluate(() => Math.ceil(document.documentElement.scrollHeight));
+      /*
+       * A STRING EXPRESSION, NOT A FUNCTION. This is not a style choice.
+       *
+       * puppeteer sends a function to the browser by calling `toString()` on it. `pkg` compiles
+       * this agent to V8 bytecode, and a bytecode function does not stringify back into source —
+       * so puppeteer refuses it with `Passed function cannot be serialized!`. It works perfectly
+       * under `npm start` and fails in the shipped exe, which is why it survived CI: the tests
+       * exercise the source tree.
+       *
+       * It only ever hit dockets and receipts. A sticker has a fixed `@page` size and never
+       * measures anything, so it took this branch and printed fine, while every docket failed —
+       * and the app reported it as `spool_failed`, "check the printer is on and not jammed", for
+       * a printer that was on and not jammed and a spooler that was never reached.
+       *
+       * Strings are evaluated as an expression and cannot be broken this way. Nothing in this
+       * file may pass a function into the page; `test/agent.test.js` enforces it.
+       */
+      const heightPx = await page.evaluate("Math.ceil(document.documentElement.scrollHeight)");
       const heightMm = Math.max(heightPx / (96 / 25.4), 10);
       return await page.pdf({
         ...common,

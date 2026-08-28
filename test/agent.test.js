@@ -262,3 +262,42 @@ test("the profile is wiped once per run, not once per print", () => {
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+/**
+ * Nothing may pass a JavaScript function into the browser.
+ *
+ * `pkg` compiles this agent to V8 bytecode, and a bytecode function does not stringify back into
+ * source — so puppeteer, which sends functions by calling `toString()` on them, refuses with
+ * `Passed function cannot be serialized!`. It works under `npm start` and fails in the shipped
+ * exe, so no test that runs the source tree can catch it by executing anything. This one reads
+ * the file instead.
+ *
+ * It cost a shop an evening: every docket failed while stickers printed, because only the
+ * auto-height path (dockets, receipts) measures the page, and the app reported the puppeteer
+ * error as "check the printer is on and not jammed".
+ */
+test("nothing passes a function into the page", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const src = fs.readFileSync(path.join(__dirname, "..", "src", "render.js"), "utf8");
+
+  // `page.evaluate(` / `page.evaluateOnNewDocument(` followed by anything that starts a function.
+  const offenders = [...src.matchAll(/\.evaluate(?:OnNewDocument|Handle)?\(\s*(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)/g)];
+
+  assert.equal(
+    offenders.length,
+    0,
+    `pass a string expression instead — ${offenders.length} call(s) hand puppeteer a function, ` +
+      "which cannot survive being packaged with pkg",
+  );
+});
+
+test("the calls that are there use strings", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const src = fs.readFileSync(path.join(__dirname, "..", "src", "render.js"), "utf8");
+
+  // The height measurement is the one that broke, so assert it specifically rather than only
+  // asserting the absence of a pattern.
+  assert.match(src, /page\.evaluate\(\s*"Math\.ceil\(document\.documentElement\.scrollHeight\)"\s*\)/);
+});

@@ -112,6 +112,16 @@ jobs:
           Write-Host "autostart: $($run.'SOS Print Agent')"
           if (-not $run.'SOS Print Agent') { throw "no autostart entry — it would not come back after a reboot" }
 
+          # Hidden, not just present. The agent is a console program, so an entry pointing straight
+          # at the exe leaves a black window on the counter all day — and closing it, which is what
+          # anybody does with a stray window, stops printing until the next sign-out. A till
+          # reported exactly that.
+          if ($run.'SOS Print Agent' -notmatch 'start-hidden\.vbs') {
+            throw "autostart does not go through start-hidden.vbs — the agent would show a console window"
+          }
+          $vbs = "${env:ProgramFiles}\SOS Print Agent\start-hidden.vbs"
+          if (-not (Test-Path $vbs)) { throw "start-hidden.vbs was not installed at $vbs" }
+
       - name: It answers, and can see the printers on this PC
         run: |
           $health = $null

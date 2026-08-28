@@ -48,6 +48,10 @@ Source: "..\dist\sos-print-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\SumatraPDF.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\SumatraPDF-LICENSE";  DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\README.md";                DestDir: "{app}"; Flags: ignoreversion
+; Starts the agent with no window. The agent is a console program, so anything that launches the
+; exe directly leaves a black console window on the counter all day — and closing it, which is
+; what anybody does with a stray window, stops printing until the next sign-out.
+Source: "start-hidden.vbs";            DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
 ; The service that 1.0.0 installed. `PrepareToInstall` stops and deregisters it; these are the
@@ -67,8 +71,12 @@ Type: filesandordirs; Name: "{commonappdata}\SOSPrintAgent\browser-profile"
 [Registry]
 ; HKLM rather than HKCU: one install covers every account that uses the till, which is what a
 ; shop with a shared counter actually has.
+; Through wscript so it starts hidden — see start-hidden.vbs. //B suppresses any script error
+; dialog, which on a till would be a modal box nobody is there to dismiss.
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
-  ValueName: "SOS Print Agent"; ValueData: """{app}\sos-print-agent.exe"""; Flags: uninsdeletevalue
+  ValueName: "SOS Print Agent"; \
+  ValueData: """{sys}\wscript.exe"" //B //Nologo ""{app}\start-hidden.vbs"""; \
+  Flags: uninsdeletevalue
 
 [Run]
 ; Started now as well as at next logon, so the shop does not have to reboot to try it — but
@@ -86,7 +94,10 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; silent install that never returns. Explorer already runs at medium integrity, so handing it the
 ; path launches the agent de-elevated and returns straight away. With no interactive session
 ; nothing starts, which is correct for an MDM push: the HKLM Run entry covers the next logon.
-Filename: "{win}\explorer.exe"; Parameters: """{app}\sos-print-agent.exe"""; Flags: nowait
+; The .vbs rather than the exe, for the same reason as the Run entry: no window. Explorer opens
+; it with wscript, which is the default handler, and the de-elevation this line exists for is
+; unchanged — explorer is medium integrity and everything it launches inherits that.
+Filename: "{win}\explorer.exe"; Parameters: """{app}\start-hidden.vbs"""; Flags: nowait
 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM sos-print-agent.exe"; Flags: runhidden; RunOnceId: "StopAgent"

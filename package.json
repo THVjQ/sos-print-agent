@@ -1,6 +1,6 @@
 {
   "name": "sos-print-agent",
-  "version": "1.1.6",
+  "version": "1.2.0",
   "description": "Localhost print agent for SOS POS — turns a print from the browser into paper from the right printer.",
   "license": "UNLICENSED",
   "private": true,
