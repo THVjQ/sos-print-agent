@@ -138,3 +138,39 @@ test("lengths convert to millimetres whatever unit they arrive in", () => {
   assert.equal(Math.round(toMm("96px") * 100) / 100, 25.4);
   assert.equal(toMm("not a length"), null);
 });
+
+/**
+ * The reason a till cannot print, picked out of Chromium's noise.
+ *
+ * A real till spent hours logging `Failed to launch the browser process!` and then a blank line,
+ * twice per job, because the retry turned on Chromium's logging but nothing was reading the pipe.
+ * The browser is now run directly and its output captured — and this is the part that decides
+ * whether what gets captured is the answer or four hundred lines of push-messaging chatter.
+ */
+test("interestingStderr picks the complaint out of the noise", () => {
+  const { interestingStderr } = require("../src/render");
+
+  const noise = (n, i) => `[1:2:0828/101531.1:VERBOSE1:google_apis/gcm/engine/${n}.cc:${i}] chatter`;
+  const lines = [
+    ...Array.from({ length: 40 }, (_, i) => noise("registration_request", i)),
+    "[1:2:0828/101532.0:ERROR:process_singleton_win.cc:123] Failed to create profile lock: Access is denied. (0x5)",
+    ...Array.from({ length: 10 }, (_, i) => noise("more_noise", i)),
+  ].join("\n");
+
+  const picked = interestingStderr(lines);
+  assert.match(picked, /Access is denied/);
+  assert.ok(!picked.includes("chatter"), "the chatter must not crowd out the error");
+});
+
+test("interestingStderr falls back to the tail when nothing complained", () => {
+  const { interestingStderr } = require("../src/render");
+  // A browser that died without saying anything at ERROR is itself worth seeing.
+  const picked = interestingStderr("one\ntwo\nthree\nfour\nfive");
+  assert.match(picked, /five/);
+});
+
+test("interestingStderr says nothing rather than an empty string", () => {
+  const { interestingStderr } = require("../src/render");
+  assert.equal(interestingStderr(""), null);
+  assert.equal(interestingStderr(undefined), null);
+});

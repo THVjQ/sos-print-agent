@@ -17,6 +17,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const puppeteer = require("puppeteer-core");
+const { spawnSync } = require("child_process");
 const log = require("./log");
 const { BROWSER_PROFILE_DIR, ELEVATED } = require("./config");
 
@@ -113,6 +114,81 @@ function launchArgs(profileDir, verbose) {
     "--disable-crash-reporter",
     ...(verbose ? ["--enable-logging=stderr", "--v=1"] : []),
   ];
+}
+
+/**
+ * The lines of Chromium's output worth putting in a log a shop will email us.
+ *
+ * Chromium is chatty even when healthy, so the last N lines are usually about cloud policy and
+ * push messaging. What is wanted is the complaint, and it is written at ERROR or FATAL — with the
+ * tail kept only for the case where it died without saying anything at that level, which is
+ * itself worth seeing.
+ */
+function interestingStderr(stderr) {
+  const lines = String(stderr || "").trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length === 0) return null;
+
+  const complaints = lines.filter((l) => /:(ERROR|FATAL):|Failed to|denied|not permitted|cannot /i.test(l));
+  const picked = complaints.length > 0 ? complaints.slice(-6) : lines.slice(-4);
+  return picked.join(" | ").slice(0, 1200);
+}
+
+/**
+ * Ask the browser directly why it will not start.
+ *
+ * The retry below turns on Chromium's own logging and the comment used to claim that meant the
+ * failure message would carry it. It does not, and a till proved it: BOTH attempts logged
+ * `Failed to launch the browser process!` followed by a blank line, twice, for hours. Puppeteer
+ * launches with `dumpio: false`, so the browser's stderr is piped nowhere — `--enable-logging`
+ * writes diligently into a pipe with no reader. And turning `dumpio` on would not fix it either,
+ * because that sends the output to the AGENT's stdout, and this log file is written by log.js
+ * rather than captured from the stream. The shop sends us agent.log; the reason was never in it.
+ *
+ * So the browser is run once, directly, with the output captured — which is the one thing that
+ * turns "it will not start" into a sentence somebody can act on. `--dump-dom about:blank` is the
+ * cheapest thing that makes it do real work and exit on its own.
+ *
+ * WITHOUT `--v=1`. Verbose logging was measured here and it buries the answer: a healthy launch
+ * writes hundreds of VERBOSE1 lines about GCM registration and cloud policy, so the tail of
+ * stderr is noise and the one line that matters has scrolled past. Chromium writes its real
+ * complaints at ERROR/FATAL, so those are picked out and the tail is only the fallback.
+ *
+ * Once per agent run, not once per print: with Edge properly broken every job would otherwise
+ * pay the timeout, and the answer would be the same every time.
+ */
+let probed = null;
+
+function probeBrowser(executablePath, profileDir) {
+  if (probed) return probed;
+
+  try {
+    const res = spawnSync(
+      executablePath,
+      [
+        ...launchArgs(profileDir, false),
+        "--enable-logging=stderr",
+        "--headless=new",
+        "--dump-dom",
+        "about:blank",
+      ],
+      { encoding: "utf8", timeout: 15000, windowsHide: true },
+    );
+
+    probed = {
+      // A non-zero exit, a signal, or no exit at all before the timeout — each means something
+      // different, and none of them were visible before.
+      exitCode: res.status,
+      signal: res.signal || null,
+      timedOut: res.error && res.error.code === "ETIMEDOUT" ? true : undefined,
+      // ENOENT here means the path is wrong, which no amount of profile juggling would fix.
+      spawnError: res.error ? String(res.error.message) : null,
+      reason: interestingStderr(res.stderr),
+    };
+  } catch (err) {
+    probed = { spawnError: String(err && err.message) };
+  }
+
+  return probed;
 }
 
 /**
@@ -220,6 +296,10 @@ async function getBrowser() {
         profileDir: retryDir,
         message: String(retryErr && retryErr.message),
       });
+      // Neither message says anything — see probeBrowser. Run the browser ourselves and log what
+      // it actually said, so the next person reading this file has a reason rather than a
+      // punctuation mark.
+      log.error("asked the browser directly why it will not start", probeBrowser(executablePath, retryDir));
       // The first failure is the one that describes the till's actual state.
       throw err;
     }
@@ -373,4 +453,4 @@ async function closeRenderer() {
   if (browser) await browser.close().catch(() => {});
 }
 
-module.exports = { htmlToPdf, findBrowser, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm };
+module.exports = { htmlToPdf, findBrowser, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm, interestingStderr };
