@@ -30,7 +30,10 @@ function run(file, args, { timeout = 30000 } = {}) {
   return new Promise((resolve, reject) => {
     execFile(file, args, { timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
+        // Both streams: SumatraPDF writes to stdout as often as to stderr, and dropping one is
+        // how a failure ends up with nothing attached to it at all.
         err.stderr = String(stderr || "");
+        err.stdout = String(stdout || "");
         return reject(err);
       }
       resolve(String(stdout || ""));
@@ -109,13 +112,42 @@ async function spool(pdfPath, printerName, copies) {
   // letting the viewer fit-to-page as well is how a 54mm label comes out at 90%.
   const settings = count > 1 ? `${count}x,noscale` : "noscale";
 
-  await run(sumatra, [
+  const args = [
     "-print-to", printerName,
     "-print-settings", settings,
     "-silent",
     "-exit-when-done",
     pdfPath,
-  ], { timeout: 60000 });
+  ];
+
+  try {
+    await run(sumatra, args, { timeout: 60000 });
+  } catch (err) {
+    /*
+     * Say what the spooler actually did.
+     *
+     * `-silent` suppresses the viewer's error dialog, which is right on a till and wrong for
+     * support: the failure came back as a bare `spool_failed`, the app turned that into "check
+     * the printer is on and not jammed", and a shop checked a printer that was on and not
+     * jammed. The exit code and whatever the viewer wrote are the only things that separate
+     * "printer refused the job" from "we passed a name it could not resolve".
+     *
+     * The printer name is logged with its exact quoting, because a printer borrowed from another
+     * machine arrives as `\\HOST\Name` and a backslash lost anywhere between here and the
+     * spooler produces precisely this failure.
+     */
+    log.error("the spooler refused the job", {
+      printerName,
+      printerNameJson: JSON.stringify(printerName),
+      settings,
+      exitCode: typeof err.code === "number" ? err.code : undefined,
+      killed: err.killed || undefined,
+      stderr: String(err.stderr || "").trim().slice(0, 600) || null,
+      stdout: String(err.stdout || "").trim().slice(0, 600) || null,
+      message: String(err && err.message).slice(0, 300),
+    });
+    throw err;
+  }
 
   log.info("spooled", { printerName, copies: count });
 }
