@@ -107,6 +107,61 @@ function usableProfileDir(dir) {
 const FALLBACK_PROFILE_DIR = path.join(os.tmpdir(), "sos-print-agent-profile");
 
 /**
+ * A profile directory per browser, wiped once per agent run.
+ *
+ * TWO faults, both proved by a till's log, both fixed by this.
+ *
+ * ONE BROWSER, ONE PROFILE. Since the launch started trying every browser installed, Edge and
+ * Chrome were being pointed at the same `--user-data-dir`, and a Chromium profile is not portable
+ * between them. Each read the other's files and refused:
+ *
+ *   Edge:   crashpad\client\settings.cc:705] Settings version is not 7
+ *   Chrome: crashpad\client\settings.cc:231] Settings version is not 1
+ *
+ * Two browsers, the same directory, each complaining about the other's version number. That one
+ * was mine, introduced with the multi-browser loop.
+ *
+ * WIPED, BECAUSE THE LOCK OUTLIVES THE PROCESS. Chrome's own histogram in the same log:
+ *
+ *   Chrome.ProcessSingleton.NotifyResult recorded 1 samples, mean = 2.0
+ *
+ * 2 is PROFILE_IN_USE: Chromium found the profile locked, declined to start, and exited 0 —
+ * which is precisely the "starts and quits without rendering" signature that has been chased all
+ * evening, on both browsers, over every transport. A launch that dies leaves its SingletonLock
+ * behind, so the next attempt finds a profile "in use" by a process that no longer exists, for
+ * ever. Starting each agent run from a clean directory is what breaks that cycle.
+ *
+ * Once per run rather than per print: the browser is kept warm between jobs, so there is nothing
+ * to gain from wiping it under a browser that is working.
+ */
+const wiped = new Set();
+
+function profileKeyFor(executablePath) {
+  // Split on BOTH separators rather than using path.basename. basename follows the platform it is
+  // running on, so a Windows path handed to it on Linux is one long filename — which turned the
+  // key into the whole path and made this untestable anywhere but Windows.
+  const file = String(executablePath || "browser").split(/[\\/]/).pop() || "browser";
+  return file
+    .toLowerCase()
+    .replace(/\.exe$/, "")
+    .replace(/[^a-z0-9]+/g, "-");
+}
+
+function freshProfileDir(base, executablePath) {
+  const dir = `${base}-${profileKeyFor(executablePath)}`;
+  if (!wiped.has(dir)) {
+    wiped.add(dir);
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Locked by something we cannot see. Carry on — a stale lock is what we were trying to
+      // clear, and failing to clear it is not a reason to skip the launch.
+    }
+  }
+  return dir;
+}
+
+/**
  * @param verbose turns on Chromium's own logging, to stderr, where puppeteer is already reading.
  *   Off for normal launches — it is thousands of lines an hour that nobody reads. On for the
  *   second attempt, because puppeteer's message carries whatever the browser wrote, and without
@@ -146,7 +201,13 @@ function interestingStderr(stderr) {
   const lines = String(stderr || "").trim().split(/\r?\n/).filter(Boolean);
   if (lines.length === 0) return null;
 
-  const complaints = lines.filter((l) => /:(ERROR|FATAL):|Failed to|denied|not permitted|cannot /i.test(l));
+  // ProcessSingleton is in here because it is the most diagnostic line Chromium ever writes and
+  // it carries no ERROR tag: `NotifyResult ... mean = 2.0` is PROFILE_IN_USE, which says the
+  // browser found the profile locked and quit — the exact failure this agent spent an evening
+  // misreading as "the browser is fine".
+  const complaints = lines.filter(
+    (l) => /:(ERROR|FATAL):|Failed to|denied|not permitted|cannot |ProcessSingleton/i.test(l),
+  );
   const picked = complaints.length > 0 ? complaints.slice(-6) : lines.slice(-4);
   return picked.join(" | ").slice(0, 1200);
 }
@@ -358,14 +419,16 @@ async function getBrowser() {
 
 /** Everything we are willing to try for ONE browser: two profiles, then a pipe. */
 async function tryBrowser(executablePath) {
+  // Its own directory, cleared at the start of this agent run. See freshProfileDir.
+  const fallbackDir = freshProfileDir(FALLBACK_PROFILE_DIR, executablePath);
+  let profileDir = freshProfileDir(BROWSER_PROFILE_DIR, executablePath);
 
-  let profileDir = BROWSER_PROFILE_DIR;
   if (!usableProfileDir(profileDir)) {
     log.warn("cannot write to the browser profile directory — using a temporary one", {
       wanted: profileDir,
-      using: FALLBACK_PROFILE_DIR,
+      using: fallbackDir,
     });
-    profileDir = FALLBACK_PROFILE_DIR;
+    profileDir = fallbackDir;
   }
 
   try {
@@ -399,9 +462,9 @@ async function tryBrowser(executablePath) {
      * message, where the first had nothing at all.
      */
     const retryDir =
-      profileDir === FALLBACK_PROFILE_DIR
-        ? path.join(os.tmpdir(), `sos-print-agent-profile-${process.pid}`)
-        : FALLBACK_PROFILE_DIR;
+      profileDir === fallbackDir
+        ? path.join(os.tmpdir(), `sos-print-agent-${profileKeyFor(executablePath)}-${process.pid}`)
+        : fallbackDir;
 
     try {
       const browser = await start(executablePath, retryDir, true, false);
@@ -595,4 +658,4 @@ async function closeRenderer() {
   if (browser) await browser.close().catch(() => {});
 }
 
-module.exports = { htmlToPdf, findBrowser, browserCandidates, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm, interestingStderr, verdictFor };
+module.exports = { htmlToPdf, findBrowser, browserCandidates, profileKeyFor, freshProfileDir, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm, interestingStderr, verdictFor };

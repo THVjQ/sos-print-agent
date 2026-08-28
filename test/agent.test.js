@@ -226,3 +226,39 @@ test("verdictFor treats a timeout and a spawn error as failures, not successes",
   assert.match(verdictFor(RENDERED, { ...DEAD, exitCode: 0, timedOut: true }), /RemoteDebuggingAllowed/);
   assert.match(verdictFor(RENDERED, { ...DEAD, exitCode: 0, spawnError: "ENOENT" }), /RemoteDebuggingAllowed/);
 });
+
+/**
+ * Edge and Chrome cannot share a profile directory.
+ *
+ * Trying every browser installed pointed both at the same `--user-data-dir`, and a Chromium
+ * profile is not portable between them — each read the other's files and refused to start:
+ * "Settings version is not 7" from Edge, "Settings version is not 1" from Chrome, in the same
+ * log, seconds apart.
+ */
+test("each browser gets its own profile directory", () => {
+  const { profileKeyFor } = require("../src/render");
+  assert.equal(profileKeyFor("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"), "msedge");
+  assert.equal(profileKeyFor("C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"), "chrome");
+  assert.notEqual(profileKeyFor("msedge.exe"), profileKeyFor("chrome.exe"));
+});
+
+test("the profile is wiped once per run, not once per print", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const { freshProfileDir } = require("../src/render");
+
+  const base = path.join(os.tmpdir(), `sos-agent-test-${process.pid}`);
+  const dir = freshProfileDir(base, "chrome.exe");
+
+  // A stale SingletonLock is what makes Chromium report PROFILE_IN_USE and quit with status 0
+  // for ever after a crash — so the first call of a run has to clear the directory.
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "SingletonLock"), "stale");
+
+  // Same run: left alone, because the browser it belongs to may be up and printing.
+  assert.equal(freshProfileDir(base, "chrome.exe"), dir);
+  assert.ok(fs.existsSync(path.join(dir, "SingletonLock")), "an in-run call must not wipe a live profile");
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
