@@ -119,6 +119,67 @@ const MAX_BODY = process.env.SOS_PRINT_MAX_BODY || "12mb";
  */
 const AUTO_UPDATE = process.env.SOS_PRINT_AUTOUPDATE === "on";
 
+/**
+ * The relay: where to collect jobs from, and who this machine says it is.
+ *
+ * Optional, and off unless a shop fills it in. Without it the agent is exactly what it has always
+ * been — a loopback receiver for the browser on its own machine — and nothing about the existing
+ * path changes.
+ *
+ * With it, the agent also *pulls* work: it tells the server which printers are on this machine,
+ * and takes jobs addressed to it. That is what lets a Mac, an iPad, or a till with no printer
+ * print at all — they leave the document with the server and this collects it. No Windows printer
+ * sharing, and nothing installed on the device that asked.
+ *
+ * The token is per store and is issued in Printer Settings. It is a printing credential and
+ * nothing more: it can claim that store's jobs and report on them.
+ *
+ * Read from a file rather than only the environment, because the installer cannot know a shop's
+ * store id and a person pasting two values into Notepad can.
+ */
+const RELAY_CONFIG_FILE =
+  process.env.SOS_PRINT_RELAY_CONFIG || path.join(LOG_DIR, "relay.json");
+
+function readRelayConfig() {
+  const fromEnv = {
+    serverUrl: process.env.SOS_PRINT_SERVER,
+    storeId: process.env.SOS_PRINT_STORE_ID,
+    token: process.env.SOS_PRINT_TOKEN,
+  };
+  if (fromEnv.serverUrl && fromEnv.storeId && fromEnv.token) return fromEnv;
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(RELAY_CONFIG_FILE, "utf8"));
+    return {
+      // Trailing slashes are what a person pastes, and they turn every URL into a double slash.
+      serverUrl: String(raw.serverUrl || raw.server || "").trim().replace(/\/+$/, "") || undefined,
+      storeId: String(raw.storeId || raw.store_id || "").trim() || undefined,
+      token: String(raw.token || "").trim() || undefined,
+    };
+  } catch {
+    // No file, or one somebody has half-edited. Either way the agent runs without the relay
+    // rather than refusing to start — a broken config file must not stop the till printing
+    // through the path that does not need it.
+    return {};
+  }
+}
+
+const RELAY = readRelayConfig();
+
+/** How often to ask for work. */
+const POLL_MS = Number(process.env.SOS_PRINT_POLL_MS || 2000);
+
+/**
+ * How often to say "I am here, and these are my printers".
+ *
+ * Twenty seconds: the app treats a station as offline after seventy, so two heartbeats can be
+ * lost before a counter is told a machine is off.
+ */
+const HEARTBEAT_MS = Number(process.env.SOS_PRINT_HEARTBEAT_MS || 20000);
+
+/** What this machine calls itself. Windows' own name, which is what a person recognises. */
+const MACHINE_NAME = String(process.env.SOS_PRINT_MACHINE_NAME || os.hostname() || "unknown").trim();
+
 module.exports = {
   HOST,
   PORT,
@@ -129,4 +190,9 @@ module.exports = {
   MAX_BODY,
   AUTO_UPDATE,
   VERSION: require("../package.json").version,
+  RELAY,
+  RELAY_CONFIG_FILE,
+  POLL_MS,
+  HEARTBEAT_MS,
+  MACHINE_NAME,
 };

@@ -25,6 +25,7 @@ const {
   VERSION,
 } = require("./config");
 const { findBrowser, browserCandidates, closeRenderer } = require("./render");
+const { startRelay, stopRelay, configured: relayConfigured } = require("./relay");
 const log = require("./log");
 
 const server = app.listen(PORT, HOST, () => {
@@ -38,6 +39,10 @@ const server = app.listen(PORT, HOST, () => {
     profileDir: BROWSER_PROFILE_DIR,
     elevated: ELEVATED,
     autoUpdate: AUTO_UPDATE,
+    // Whether this machine also collects work for devices that cannot print themselves. Off
+    // unless a shop has filled in relay.json, and stated here so a support log says which of the
+    // two shapes this till is in.
+    relay: relayConfigured(),
   });
   if (!findBrowser()) {
     log.error("no Edge or Chrome on this machine — /print will fail with no_renderer");
@@ -56,6 +61,10 @@ const server = app.listen(PORT, HOST, () => {
         "will fail until this is restarted as a normal user. Sign out and back in.",
     );
   }
+
+  // After the listener is up, so a till that is only ever used for its own printing is serving
+  // before anything talks to the network.
+  startRelay();
 });
 
 server.on("error", (err) => {
@@ -79,6 +88,8 @@ server.on("error", (err) => {
 async function shutdown(signal) {
   log.info("shutting down", { signal });
   server.close();
+  // The polling loop first: a claim taken after this point would be printed by nobody.
+  stopRelay();
   await closeRenderer();
   process.exit(0);
 }
