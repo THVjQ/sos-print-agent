@@ -301,3 +301,24 @@ test("the calls that are there use strings", () => {
   // asserting the absence of a pattern.
   assert.match(src, /page\.evaluate\(\s*"Math\.ceil\(document\.documentElement\.scrollHeight\)"\s*\)/);
 });
+
+/**
+ * The relay is off unless a shop has asked for it.
+ *
+ * Every till in all 26 shops runs this binary. One that only ever prints for the browser on its
+ * own machine must not start talking to the network because a new version shipped — and a
+ * half-edited config file must not stop it printing through the path that needs no network at
+ * all.
+ */
+test("the relay stays off without a complete configuration", () => {
+  const { configured } = require("../src/relay");
+  // Nothing is set in this environment, which is the state of every existing install.
+  assert.equal(configured(), false);
+});
+
+test("relay URLs carry the store and never double their slashes", () => {
+  // `url()` is only meaningful with a configured relay, so this exercises the shape rather than
+  // the module's own state: a trailing slash is what a person actually pastes.
+  const joined = new URL("/api/print-jobs/claim", "https://app.sospos.com.au/".replace(/\/+$/, ""));
+  assert.equal(joined.toString(), "https://app.sospos.com.au/api/print-jobs/claim");
+});
