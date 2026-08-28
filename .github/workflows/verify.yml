@@ -229,12 +229,23 @@ jobs:
         # it can say why and every print fails with an empty error. Asserted after real prints
         # have happened, so the directory being checked is one the renderer actually used.
         run: |
-          $stale = "$env:ProgramData\SOSPrintAgent\browser-profile"
-          if (Test-Path $stale) { throw "the renderer put its profile back under ProgramData: $stale" }
+          $stale = Get-ChildItem "$env:ProgramData\SOSPrintAgent" -Filter "browser-profile*" -Directory -ErrorAction SilentlyContinue
+          if ($stale) { throw "the renderer put its profile back under ProgramData: $($stale.FullName -join ', ')" }
 
-          $mine = "$env:LOCALAPPDATA\SOSPrintAgent\browser-profile"
-          if (-not (Test-Path $mine)) { throw "no browser profile at $mine — did it fall back to a temporary one?" }
-          Write-Host "profile at $mine, $((Get-ChildItem $mine -Recurse -ErrorAction SilentlyContinue).Count) items"
+          # One directory PER BROWSER — `browser-profile-msedge`, `browser-profile-chrome` — since
+          # the launch tries every browser installed and a Chromium profile is not portable
+          # between them. Sharing one made Edge and Chrome each refuse the other's files
+          # ("Settings version is not 7" / "not 1"), so the suffix is the fix, not a detail.
+          $mine = Get-ChildItem "$env:LOCALAPPDATA\SOSPrintAgent" -Filter "browser-profile-*" -Directory -ErrorAction SilentlyContinue
+          if (-not $mine) { throw "no browser profile under $env:LOCALAPPDATA\SOSPrintAgent — did it fall back to a temporary one?" }
+          foreach ($p in $mine) {
+            Write-Host "profile at $($p.FullName), $((Get-ChildItem $p.FullName -Recurse -ErrorAction SilentlyContinue).Count) items"
+          }
+
+          # The un-suffixed name must be gone: that is the shared directory the two browsers were
+          # fighting over, and a profile there means the per-browser split has been undone.
+          $shared = "$env:LOCALAPPDATA\SOSPrintAgent\browser-profile"
+          if (Test-Path $shared) { throw "a shared profile is back at $shared — Edge and Chrome cannot both use it" }
 
           # And the fallback did not have to be used, which would mean the proper path was
           # unwritable — it prints either way, so only the log says so.
