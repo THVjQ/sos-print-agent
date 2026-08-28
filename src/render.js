@@ -134,6 +134,29 @@ function interestingStderr(stderr) {
 }
 
 /**
+ * What the pair of probes means, in a sentence.
+ *
+ * The log is read by whoever is standing at the till, not by whoever wrote this, so the
+ * conclusion belongs in the file rather than in somebody's head.
+ */
+function verdictFor(plain, debugging) {
+  const ok = (r) => r.exitCode === 0 && !r.spawnError && !r.timedOut;
+
+  if (!ok(plain)) {
+    return "the browser will not run at all on this machine, with or without debugging — this is Edge itself, not the agent";
+  }
+  if (ok(debugging)) {
+    return "the browser runs fine both ways, so the launch failure is not the browser — suspect a security product closing the debugging connection, or an agent bug";
+  }
+  return (
+    "the browser runs fine UNTIL it is asked for a debugging endpoint, then it exits. That is " +
+    "almost always the Edge policy RemoteDebuggingAllowed being turned off on this machine " +
+    "(check edge://policy), or a security product blocking it. The agent needs that endpoint to " +
+    "drive the browser, so printing cannot work until it is allowed."
+  );
+}
+
+/**
  * Ask the browser directly why it will not start.
  *
  * The retry below turns on Chromium's own logging and the comment used to claim that meant the
@@ -144,9 +167,17 @@ function interestingStderr(stderr) {
  * because that sends the output to the AGENT's stdout, and this log file is written by log.js
  * rather than captured from the stream. The shop sends us agent.log; the reason was never in it.
  *
- * So the browser is run once, directly, with the output captured — which is the one thing that
- * turns "it will not start" into a sentence somebody can act on. `--dump-dom about:blank` is the
+ * So the browser is run directly, with the output captured — which is the one thing that turns
+ * "it will not start" into a sentence somebody can act on. `--dump-dom about:blank` is the
  * cheapest thing that makes it do real work and exit on its own.
+ *
+ * IT IS RUN TWICE, and the pair is the diagnosis. A till running 1.1.2 reported `exitCode: 0`
+ * with no error and no output at all — Edge started, did the work, and exited cleanly. So the
+ * browser is fine, the profile is fine, and the path is fine. The only thing puppeteer does
+ * differently is ask for a debugging endpoint and wait for it. So the second probe adds exactly
+ * that flag and nothing else: if the plain run succeeds and the debugging one does not, the
+ * browser is refusing to expose the endpoint, which is a policy on the machine and not a fault
+ * in this agent.
  *
  * WITHOUT `--v=1`. Verbose logging was measured here and it buries the answer: a healthy launch
  * writes hundreds of VERBOSE1 lines about GCM registration and cloud policy, so the tail of
@@ -162,27 +193,39 @@ function probeBrowser(executablePath, profileDir) {
   if (probed) return probed;
 
   try {
-    const res = spawnSync(
-      executablePath,
-      [
-        ...launchArgs(profileDir, false),
-        "--enable-logging=stderr",
-        "--headless=new",
-        "--dump-dom",
-        "about:blank",
-      ],
-      { encoding: "utf8", timeout: 15000, windowsHide: true },
-    );
+    const run = (extra) => {
+      const res = spawnSync(
+        executablePath,
+        [
+          ...launchArgs(profileDir, false),
+          "--enable-logging=stderr",
+          "--headless=new",
+          ...extra,
+          "--dump-dom",
+          "about:blank",
+        ],
+        { encoding: "utf8", timeout: 15000, windowsHide: true },
+      );
+      return {
+        // A non-zero exit, a signal, or no exit at all before the timeout — each means something
+        // different, and none of them were visible before.
+        exitCode: res.status,
+        signal: res.signal || null,
+        timedOut: res.error && res.error.code === "ETIMEDOUT" ? true : undefined,
+        // ENOENT here means the path is wrong, which no amount of profile juggling would fix.
+        spawnError: res.error ? String(res.error.message) : null,
+        reason: interestingStderr(res.stderr),
+      };
+    };
+
+    const plain = run([]);
+    const debugging = run(["--remote-debugging-port=0"]);
 
     probed = {
-      // A non-zero exit, a signal, or no exit at all before the timeout — each means something
-      // different, and none of them were visible before.
-      exitCode: res.status,
-      signal: res.signal || null,
-      timedOut: res.error && res.error.code === "ETIMEDOUT" ? true : undefined,
-      // ENOENT here means the path is wrong, which no amount of profile juggling would fix.
-      spawnError: res.error ? String(res.error.message) : null,
-      reason: interestingStderr(res.stderr),
+      plain,
+      debugging,
+      // The sentence somebody can act on, worked out here rather than left to the reader.
+      verdict: verdictFor(plain, debugging),
     };
   } catch (err) {
     probed = { spawnError: String(err && err.message) };
@@ -201,11 +244,19 @@ function probeBrowser(executablePath, profileDir) {
  */
 let browserPromise = null;
 
-async function start(executablePath, profileDir, verbose) {
+/**
+ * @param pipe drives the browser over a pair of file descriptors instead of a localhost TCP
+ *   port. Puppeteer's default is `--remote-debugging-port=0`, and on a managed Windows machine
+ *   that port is the fragile part: Edge policy can forbid it outright, and security software
+ *   routinely blocks a process connecting to a listening port that another process just opened.
+ *   The pipe asks for none of that, so it is worth trying before giving up.
+ */
+async function start(executablePath, profileDir, verbose, pipe) {
   browserPromise = puppeteer.launch({
     executablePath,
     headless: true,
     dumpio: false,
+    pipe: !!pipe,
     args: launchArgs(profileDir, verbose),
   });
 
@@ -220,6 +271,7 @@ async function start(executablePath, profileDir, verbose) {
   log.info("renderer started", {
     executablePath,
     profileDir,
+    transport: pipe ? "pipe" : "port",
     version: await browser.version().catch(() => "?"),
   });
   return browser;
@@ -250,7 +302,7 @@ async function getBrowser() {
   }
 
   try {
-    return await start(executablePath, profileDir, false);
+    return await start(executablePath, profileDir, false, false);
   } catch (err) {
     // Puppeteer's own message is "undefined" when the browser exits with a code, and empty when
     // it exits cleanly without ever opening its debugging port — so the path, the account and
@@ -285,7 +337,7 @@ async function getBrowser() {
         : FALLBACK_PROFILE_DIR;
 
     try {
-      const browser = await start(executablePath, retryDir, true);
+      const browser = await start(executablePath, retryDir, true, false);
       log.warn("renderer started on a second attempt — the usual profile could not be used", {
         wanted: profileDir,
         using: retryDir,
@@ -296,9 +348,32 @@ async function getBrowser() {
         profileDir: retryDir,
         message: String(retryErr && retryErr.message),
       });
-      // Neither message says anything — see probeBrowser. Run the browser ourselves and log what
-      // it actually said, so the next person reading this file has a reason rather than a
-      // punctuation mark.
+
+      /*
+       * Third attempt, over a pipe instead of a localhost port.
+       *
+       * Both failures above are the SAME failure twice — the profile was never the problem, which
+       * a till proved: run directly, the browser starts, works and exits 0. What it will not do
+       * is hand back a debugging endpoint on a TCP port. The pipe transport asks for no port at
+       * all, so where a policy or a security product is blocking that port, this is the attempt
+       * that prints.
+       */
+      try {
+        const browser = await start(executablePath, profileDir, false, true);
+        log.warn(
+          "renderer started over a pipe — this machine will not allow the debugging port, so " +
+            "printing works but something here is blocking localhost debugging",
+          { profileDir },
+        );
+        return browser;
+      } catch (pipeErr) {
+        log.error("the renderer would not start over a pipe either", {
+          message: String(pipeErr && pipeErr.message),
+        });
+      }
+
+      // Nothing worked. Run the browser ourselves, twice, and write down what it actually did —
+      // so the next person reading this file has a reason rather than a punctuation mark.
       log.error("asked the browser directly why it will not start", probeBrowser(executablePath, retryDir));
       // The first failure is the one that describes the till's actual state.
       throw err;
@@ -453,4 +528,4 @@ async function closeRenderer() {
   if (browser) await browser.close().catch(() => {});
 }
 
-module.exports = { htmlToPdf, findBrowser, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm, interestingStderr };
+module.exports = { htmlToPdf, findBrowser, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm, interestingStderr, verdictFor };

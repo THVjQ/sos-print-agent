@@ -174,3 +174,43 @@ test("interestingStderr says nothing rather than an empty string", () => {
   assert.equal(interestingStderr(""), null);
   assert.equal(interestingStderr(undefined), null);
 });
+
+/**
+ * The pair of probes, turned into a sentence.
+ *
+ * A till on 1.1.2 reported `exitCode: 0` with no error and no output — the browser started, did
+ * the work and exited cleanly. That ruled out the browser, the profile and the path all at once,
+ * and left only the thing puppeteer does differently: ask for a debugging endpoint. These are the
+ * three states that pair can be in, and each needs a different person to do a different thing.
+ */
+test("verdictFor names the machine's policy when only debugging fails", () => {
+  const { verdictFor } = require("../src/render");
+  const ok = { exitCode: 0, spawnError: null };
+  const dead = { exitCode: 1, spawnError: null };
+
+  const v = verdictFor(ok, dead);
+  assert.match(v, /RemoteDebuggingAllowed/);
+  assert.match(v, /edge:\/\/policy/);
+});
+
+test("verdictFor blames the browser when it will not run at all", () => {
+  const { verdictFor } = require("../src/render");
+  const dead = { exitCode: 1, spawnError: null };
+  const v = verdictFor(dead, dead);
+  assert.match(v, /not the agent/);
+  assert.ok(!/RemoteDebuggingAllowed/.test(v), "a browser that never runs is not a policy problem");
+});
+
+test("verdictFor does not blame the browser when both probes are healthy", () => {
+  const { verdictFor } = require("../src/render");
+  const ok = { exitCode: 0, spawnError: null };
+  const v = verdictFor(ok, ok);
+  assert.match(v, /not the browser/);
+});
+
+test("verdictFor treats a timeout and a spawn error as failures, not successes", () => {
+  const { verdictFor } = require("../src/render");
+  const ok = { exitCode: 0, spawnError: null };
+  assert.match(verdictFor(ok, { exitCode: 0, timedOut: true }), /RemoteDebuggingAllowed/);
+  assert.match(verdictFor(ok, { exitCode: 0, spawnError: "ENOENT" }), /RemoteDebuggingAllowed/);
+});
