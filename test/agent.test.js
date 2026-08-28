@@ -183,34 +183,46 @@ test("interestingStderr says nothing rather than an empty string", () => {
  * and left only the thing puppeteer does differently: ask for a debugging endpoint. These are the
  * three states that pair can be in, and each needs a different person to do a different thing.
  */
+const RENDERED = { exitCode: 0, spawnError: null, stdoutBytes: 2048 };
+const RAN_BUT_DID_NOTHING = { exitCode: 0, spawnError: null, stdoutBytes: 0 };
+const DEAD = { exitCode: 1, spawnError: null, stdoutBytes: 0 };
+
 test("verdictFor names the machine's policy when only debugging fails", () => {
   const { verdictFor } = require("../src/render");
-  const ok = { exitCode: 0, spawnError: null };
-  const dead = { exitCode: 1, spawnError: null };
-
-  const v = verdictFor(ok, dead);
+  const v = verdictFor(RENDERED, DEAD);
   assert.match(v, /RemoteDebuggingAllowed/);
   assert.match(v, /edge:\/\/policy/);
 });
 
 test("verdictFor blames the browser when it will not run at all", () => {
   const { verdictFor } = require("../src/render");
-  const dead = { exitCode: 1, spawnError: null };
-  const v = verdictFor(dead, dead);
+  const v = verdictFor(DEAD, DEAD);
   assert.match(v, /not the agent/);
   assert.ok(!/RemoteDebuggingAllowed/.test(v), "a browser that never runs is not a policy problem");
 });
 
-test("verdictFor does not blame the browser when both probes are healthy", () => {
+test("verdictFor does not blame the browser when both probes rendered", () => {
   const { verdictFor } = require("../src/render");
-  const ok = { exitCode: 0, spawnError: null };
-  const v = verdictFor(ok, ok);
-  assert.match(v, /not the browser/);
+  assert.match(verdictFor(RENDERED, RENDERED), /not the browser/);
+});
+
+/**
+ * The one a real till got wrong.
+ *
+ * 1.1.3 judged on the exit code alone and told a shop "the browser runs fine both ways" about a
+ * browser that was exiting immediately having rendered nothing. `--dump-dom` prints the page, so
+ * no output means no render — that is a quitting browser, not a healthy one.
+ */
+test("verdictFor does not call a browser healthy when it rendered nothing", () => {
+  const { verdictFor } = require("../src/render");
+  const v = verdictFor(RAN_BUT_DID_NOTHING, RAN_BUT_DID_NOTHING);
+  assert.match(v, /without rendering anything/);
+  assert.ok(!/not the browser/.test(v), "it very much is the browser");
+  assert.match(v, /Chrome/, "and the way out is the other browser on the machine");
 });
 
 test("verdictFor treats a timeout and a spawn error as failures, not successes", () => {
   const { verdictFor } = require("../src/render");
-  const ok = { exitCode: 0, spawnError: null };
-  assert.match(verdictFor(ok, { exitCode: 0, timedOut: true }), /RemoteDebuggingAllowed/);
-  assert.match(verdictFor(ok, { exitCode: 0, spawnError: "ENOENT" }), /RemoteDebuggingAllowed/);
+  assert.match(verdictFor(RENDERED, { ...DEAD, exitCode: 0, timedOut: true }), /RemoteDebuggingAllowed/);
+  assert.match(verdictFor(RENDERED, { ...DEAD, exitCode: 0, spawnError: "ENOENT" }), /RemoteDebuggingAllowed/);
 });

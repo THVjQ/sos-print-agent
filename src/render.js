@@ -49,15 +49,33 @@ function candidatePaths() {
   ];
 }
 
-function findBrowser() {
+/**
+ * Every browser on this machine, not just the first one.
+ *
+ * `findBrowser` returned the first path that existed and the launch never looked at the rest, so
+ * one uncooperative install was the end of it — with a perfectly good Chrome sitting beside it.
+ *
+ * That matters more than it sounds on Windows. `Program Files (x86)\\Microsoft\\Edge` is tried
+ * first and is where Edge normally lives, but a machine that has been through an upgrade can have
+ * an msedge.exe there that hands off to another install and exits 0 immediately — which looks
+ * exactly like the failure on this till: the process we are holding is gone before it says
+ * anything, every time, whatever the profile or the transport.
+ */
+function browserCandidates() {
+  const found = [];
   for (const candidate of candidatePaths()) {
     try {
-      if (fs.existsSync(candidate)) return candidate;
+      if (fs.existsSync(candidate)) found.push(candidate);
     } catch {
       /* keep looking */
     }
   }
-  return null;
+  return found;
+}
+
+/** The one we would use first. Kept for the health endpoint and the startup log. */
+function findBrowser() {
+  return browserCandidates()[0] || null;
 }
 
 /**
@@ -140,16 +158,30 @@ function interestingStderr(stderr) {
  * conclusion belongs in the file rather than in somebody's head.
  */
 function verdictFor(plain, debugging) {
-  const ok = (r) => r.exitCode === 0 && !r.spawnError && !r.timedOut;
+  // Exit code AND evidence of work. `--dump-dom` prints the page, so a run that exits 0 having
+  // printed nothing did not render — see stdoutBytes.
+  const ok = (r) => r.exitCode === 0 && !r.spawnError && !r.timedOut && (r.stdoutBytes || 0) > 0;
+  const ran = (r) => r.exitCode === 0 && !r.spawnError && !r.timedOut;
 
-  if (!ok(plain)) {
+  if (!ran(plain)) {
     return "the browser will not run at all on this machine, with or without debugging — this is Edge itself, not the agent";
   }
-  if (ok(debugging)) {
-    return "the browser runs fine both ways, so the launch failure is not the browser — suspect a security product closing the debugging connection, or an agent bug";
+
+  if (!ok(plain) && !ok(debugging)) {
+    return (
+      "the browser exits straight away, reporting success, without rendering anything — so it is " +
+      "not being driven, it is quitting. On Windows that is usually an msedge.exe that hands off " +
+      "to another install and exits: try Chrome on this machine instead (the agent now tries " +
+      "every browser it finds), or repair the Edge installation."
+    );
   }
+
+  if (ok(debugging)) {
+    return "the browser renders fine both ways, so the launch failure is not the browser — suspect a security product closing the debugging connection, or an agent bug";
+  }
+
   return (
-    "the browser runs fine UNTIL it is asked for a debugging endpoint, then it exits. That is " +
+    "the browser renders fine UNTIL it is asked for a debugging endpoint, then it exits. That is " +
     "almost always the Edge policy RemoteDebuggingAllowed being turned off on this machine " +
     "(check edge://policy), or a security product blocking it. The agent needs that endpoint to " +
     "drive the browser, so printing cannot work until it is allowed."
@@ -214,6 +246,13 @@ function probeBrowser(executablePath, profileDir) {
         timedOut: res.error && res.error.code === "ETIMEDOUT" ? true : undefined,
         // ENOENT here means the path is wrong, which no amount of profile juggling would fix.
         spawnError: res.error ? String(res.error.message) : null,
+        // Did it actually DO anything. This is the field the 1.1.3 probe was missing, and its
+        // absence made the verdict wrong on a real till: `--dump-dom` asks the browser to print
+        // the page and exit, so an exit code of 0 with no output at all is not a healthy browser
+        // — it is one that started and stopped without rendering, which is precisely the failure
+        // being chased. Treating exit 0 as success said "the browser is fine" about a browser
+        // that was doing nothing.
+        stdoutBytes: String(res.stdout || "").length,
         reason: interestingStderr(res.stderr),
       };
     };
@@ -285,12 +324,40 @@ async function getBrowser() {
     browserPromise = null;
   }
 
-  const executablePath = findBrowser();
-  if (!executablePath) {
+  const candidates = browserCandidates();
+  if (candidates.length === 0) {
     const err = new Error("no_renderer");
     err.code = "no_renderer";
     throw err;
   }
+
+  /*
+   * Every browser installed, in turn.
+   *
+   * A till spent an evening on this: Edge started, exited 0 immediately and said nothing, over a
+   * port and over a pipe and on two different profiles — and Chrome was installed on the same
+   * machine the whole time, never tried, because the first path that existed was the only one
+   * this ever looked at.
+   */
+  let lastError = null;
+  for (const executablePath of candidates) {
+    try {
+      return await tryBrowser(executablePath);
+    } catch (err) {
+      lastError = err;
+      if (candidates.length > 1) {
+        log.warn("that browser would not start — trying the next one installed", {
+          failed: executablePath,
+          remaining: candidates.filter((c) => c !== executablePath),
+        });
+      }
+    }
+  }
+  throw lastError;
+}
+
+/** Everything we are willing to try for ONE browser: two profiles, then a pipe. */
+async function tryBrowser(executablePath) {
 
   let profileDir = BROWSER_PROFILE_DIR;
   if (!usableProfileDir(profileDir)) {
@@ -528,4 +595,4 @@ async function closeRenderer() {
   if (browser) await browser.close().catch(() => {});
 }
 
-module.exports = { htmlToPdf, findBrowser, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm, interestingStderr, verdictFor };
+module.exports = { htmlToPdf, findBrowser, browserCandidates, closeRenderer, neutralisePrintScripts, readPageRule, autoHeightWidthMm, toMm, interestingStderr, verdictFor };

@@ -24,13 +24,16 @@ const {
   AUTO_UPDATE,
   VERSION,
 } = require("./config");
-const { findBrowser, closeRenderer } = require("./render");
+const { findBrowser, browserCandidates, closeRenderer } = require("./render");
 const log = require("./log");
 
 const server = app.listen(PORT, HOST, () => {
   log.info(`sos-print-agent ${VERSION} listening on http://${HOST}:${PORT}`, {
     allowedOrigins: ALLOWED_ORIGINS,
     renderer: findBrowser() || "NOT FOUND",
+    // All of them, because the launch now falls through to the next one and a support log that
+    // names only the first cannot explain which browser actually printed.
+    renderersInstalled: browserCandidates(),
     logDir: LOG_DIR,
     profileDir: BROWSER_PROFILE_DIR,
     elevated: ELEVATED,
