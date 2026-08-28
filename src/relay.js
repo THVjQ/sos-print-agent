@@ -22,29 +22,103 @@ const { htmlToPdf } = require("./render");
 const { listPrinters, spool } = require("./printers");
 const log = require("./log");
 const {
-  RELAY, POLL_MS, HEARTBEAT_MS, MACHINE_NAME, VERSION,
+  RELAY, RELAY_CONFIG_FILE, POLL_MS, HEARTBEAT_MS, MACHINE_NAME, VERSION,
 } = require("./config");
 
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+/**
+ * The relay settings this agent is running with, right now.
+ *
+ * A copy rather than the frozen value from config, because the settings page sets this up over
+ * loopback while the agent is running — see `applyRelayConfig`. Reading the module constant would
+ * mean a shop had to restart the agent, or sign out and back in, to finish a setup that has
+ * already succeeded. That is exactly the manual step this is meant to remove.
+ */
+let current = { ...RELAY };
+
 function configured() {
-  return Boolean(RELAY && RELAY.serverUrl && RELAY.storeId && RELAY.token);
+  return Boolean(current && current.serverUrl && current.storeId && current.token);
+}
+
+/** What the settings page shows about this machine. Never the token — it is write-only from here. */
+function relayStatus() {
+  return {
+    configured: configured(),
+    running,
+    serverUrl: current.serverUrl || null,
+    storeId: current.storeId || null,
+    machineName: MACHINE_NAME,
+    stationId,
+  };
+}
+
+/**
+ * Point this agent at a server, and start collecting straight away.
+ *
+ * Called by the SOS POS settings page over loopback. The alternative was a person saving a JSON
+ * file into ProgramData by hand and restarting the agent, which is three chances to get it wrong
+ * and no feedback on any of them — a shop did exactly that and ended up with an empty Printing PCs
+ * list and no way to tell which step had failed.
+ *
+ * Written to disk as well as applied in memory, or the setup would not survive the next restart.
+ */
+function applyRelayConfig(next) {
+  const serverUrl = String(next?.serverUrl || "").trim().replace(/\/+$/, "");
+  const storeId = String(next?.storeId || "").trim();
+  const token = String(next?.token || "").trim();
+
+  if (!serverUrl || !storeId || !token) {
+    throw Object.assign(new Error("serverUrl, storeId and token are all required"), { code: "bad_config" });
+  }
+  // A typo here would otherwise surface as a heartbeat failing every twenty seconds for ever.
+  let parsed;
+  try {
+    parsed = new URL(serverUrl);
+  } catch {
+    throw Object.assign(new Error(`"${serverUrl}" is not a web address`), { code: "bad_config" });
+  }
+  if (!/^https?:$/.test(parsed.protocol)) {
+    throw Object.assign(new Error("the server address has to be http or https"), { code: "bad_config" });
+  }
+
+  stopRelay();
+  // The station id belongs to the old server. Keeping it would make the first claim ask another
+  // shop's server about a station it has never heard of.
+  stationId = null;
+  current = { serverUrl, storeId, token };
+
+  try {
+    fs.mkdirSync(path.dirname(RELAY_CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(RELAY_CONFIG_FILE, JSON.stringify({ serverUrl, storeId, token }, null, 2));
+  } catch (err) {
+    // Applied but not saved: it will print until the agent restarts, and the log says why it
+    // stopped afterwards. Better than refusing a setup that otherwise works.
+    log.error("could not save the relay configuration — it will be lost on restart", {
+      file: RELAY_CONFIG_FILE,
+      message: String(err && err.message),
+    });
+  }
+
+  log.info("relay configured from the settings page", { server: serverUrl, storeId, machineName: MACHINE_NAME });
+  startRelay();
+  return relayStatus();
 }
 
 /** Every request carries the store token and the store it is for. */
 function headers() {
   return {
     "Content-Type": "application/json",
-    "X-Print-Token": RELAY.token,
-    "X-Print-Store": RELAY.storeId,
+    "X-Print-Token": current.token,
+    "X-Print-Store": current.storeId,
   };
 }
 
 function url(pathname, params = {}) {
-  const u = new URL(pathname, RELAY.serverUrl);
-  u.searchParams.set("store_id", RELAY.storeId);
+  const u = new URL(pathname, current.serverUrl);
+  u.searchParams.set("store_id", current.storeId);
   for (const [k, v] of Object.entries(params)) if (v != null) u.searchParams.set(k, String(v));
   return u.toString();
 }
@@ -97,8 +171,8 @@ async function heartbeat() {
     // fixes it. Everything else is worth retrying quietly.
     if (res.status === 401) {
       log.error("SOS POS did not recognise this agent — the store's print token has changed", {
-        server: RELAY.serverUrl,
-        storeId: RELAY.storeId,
+        server: current.serverUrl,
+        storeId: current.storeId,
         fix: "copy the token again from Printer Settings into relay.json",
       });
     }
@@ -217,8 +291,8 @@ function startRelay() {
 
   running = true;
   log.info("relay enabled", {
-    server: RELAY.serverUrl,
-    storeId: RELAY.storeId,
+    server: current.serverUrl,
+    storeId: current.storeId,
     machineName: MACHINE_NAME,
     pollMs: POLL_MS,
   });
@@ -236,4 +310,4 @@ function stopRelay() {
   running = false;
 }
 
-module.exports = { startRelay, stopRelay, configured, heartbeat, runOneJob, url };
+module.exports = { startRelay, stopRelay, configured, relayStatus, applyRelayConfig, heartbeat, runOneJob, url };

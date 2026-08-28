@@ -17,6 +17,7 @@ const express = require("express");
 const { ALLOWED_ORIGINS, ELEVATED, MAX_BODY, VERSION } = require("./config");
 const log = require("./log");
 const { htmlToPdf, findBrowser } = require("./render");
+const { relayStatus, applyRelayConfig } = require("./relay");
 const { listPrinters, spool, findSumatra } = require("./printers");
 
 /**
@@ -76,7 +77,37 @@ app.get("/health", (req, res) => {
     // to be able to say "sign out and back in" instead of a shop guessing.
     elevated: ELEVATED,
     host: os.hostname(),
+    // Whether this machine also collects jobs for devices that cannot print themselves. The
+    // settings page uses it to show "this PC is set up" without a second request.
+    relay: relayStatus(),
   });
+});
+
+/**
+ * Set this machine up as a printing PC, from the settings page.
+ *
+ * The agent and the browser are on the same machine and already talk over loopback, so there is
+ * no reason a person should be saving a JSON file into ProgramData by hand and restarting the
+ * agent to finish a setup the page could just do. That way had three steps to get wrong and gave
+ * no feedback on any of them — a shop followed it exactly and ended up with an empty Printing PCs
+ * list and no way to tell which step had failed.
+ *
+ * Safe to expose because of where it is: 127.0.0.1 only, and the CORS check above admits only the
+ * SOS POS origins. The same trust boundary that already lets a page print here.
+ */
+app.get("/relay", (req, res) => {
+  res.json(relayStatus());
+});
+
+app.post("/relay", (req, res) => {
+  try {
+    const status = applyRelayConfig(req.body || {});
+    res.json({ ok: true, ...status });
+  } catch (err) {
+    const bad = err && err.code === "bad_config";
+    log.warn("refused a relay configuration", { message: reason(err) });
+    res.status(bad ? 400 : 500).json({ ok: false, error: err?.code || "relay_failed", detail: reason(err) });
+  }
 });
 
 app.get("/printers", async (req, res) => {

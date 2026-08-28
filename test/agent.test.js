@@ -322,3 +322,44 @@ test("relay URLs carry the store and never double their slashes", () => {
   const joined = new URL("/api/print-jobs/claim", "https://app.sospos.com.au/".replace(/\/+$/, ""));
   assert.equal(joined.toString(), "https://app.sospos.com.au/api/print-jobs/claim");
 });
+
+/**
+ * Setting a printing PC up from the settings page, rather than by hand.
+ *
+ * The first version of this needed a person to save a JSON file into ProgramData and restart the
+ * agent. Three steps to get wrong with no feedback on any of them — a shop followed them exactly
+ * and still ended up looking at an empty Printing PCs list. The page can reach the agent on
+ * loopback, so it just tells it.
+ */
+test("a relay configuration missing any part is refused", () => {
+  const { applyRelayConfig } = require("../src/relay");
+  for (const bad of [
+    {},
+    { serverUrl: "https://app.sospos.com.au" },
+    { serverUrl: "https://app.sospos.com.au", storeId: "s1" },
+    { storeId: "s1", token: "t" },
+  ]) {
+    assert.throws(() => applyRelayConfig(bad), /required/, `should have refused ${JSON.stringify(bad)}`);
+  }
+});
+
+test("a server address that is not a web address is refused", () => {
+  const { applyRelayConfig } = require("../src/relay");
+  // Otherwise a typo surfaces as a heartbeat failing every twenty seconds, for ever, with the
+  // settings page saying only that the station never appeared.
+  assert.throws(
+    () => applyRelayConfig({ serverUrl: "app.sospos.com.au", storeId: "s1", token: "t" }),
+    /not a web address/,
+  );
+  assert.throws(
+    () => applyRelayConfig({ serverUrl: "ftp://app.sospos.com.au", storeId: "s1", token: "t" }),
+    /http or https/,
+  );
+});
+
+test("the status never reports the token back", () => {
+  const { relayStatus } = require("../src/relay");
+  // It is write-only from the agent's side: the page already knows it, and anything that can read
+  // /relay could otherwise read a store's print credential out of a machine.
+  assert.ok(!("token" in relayStatus()));
+});
